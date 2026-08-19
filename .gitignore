@@ -1,0 +1,26 @@
+# 官方代码仓库克隆（含其自身 .git，不入库）
+NitroGen/
+
+# 模型权重与数据（体积大，按 README 步骤下载）
+*.pt
+*.tar.gz
+*.parquet
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# 日志与临时文件
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
