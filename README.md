@@ -13,8 +13,8 @@
 | # | 必做内容 | 状态 |
 | --- | --- | --- |
 | 1 | 跑通官方 ng.pt 推理，README 可复现 | ✅ 环境就绪，冒烟测试通过 |
-| 2 | 单游戏（Hollow Knight）≥ 500 帧标注：按键/摇杆分布统计 + ≥ 10 条序列可视化 | 进行中 |
-| 3 | ≥ 200 帧测试集：按键准确率、摇杆 MSE / 相关系数 | 待做 |
+| 2 | 单游戏（Hollow Knight）≥ 500 帧标注：按键/摇杆分布统计 + ≥ 10 条序列可视化 | 🔶 标注已提取（1,444,200 帧），统计出图进行中 |
+| 3 | ≥ 200 帧测试集：按键准确率、摇杆 MSE / 相关系数 | 待做（指标口径已定，见第 2 天报告） |
 | 4 | zero-shot 基线：按键准确率 ≥ 50%，摇杆相关系数 ≥ 0.4 | 待做 |
 | 5 | 第 5 天演示：模型输出 vs 标注对比 | 待做 |
 | 6 | 归档代码与指标表，实验说明写入结课大报告 | 待做 |
@@ -29,7 +29,8 @@ general-gaming-AI/
 ├── README.md            # 本文件（可复现说明）
 ├── 立项书.md             # 第 1 天立项书
 ├── scripts/             # 本课题自有脚本
-│   └── smoke_test.py    # ng.pt 端到端推理冒烟测试
+│   ├── smoke_test.py    # ng.pt 端到端推理冒烟测试
+│   └── extract_hollow_knight.py  # 从 SHARD_0034 提取 Hollow Knight 标注
 ├── NitroGen/            # 官方代码仓库克隆（不入库，见 .gitignore）
 │   ├── ng.pt            # 预训练权重 1.84 GB（不入库）
 │   └── .venv/           # Python 虚拟环境（不入库）
@@ -39,6 +40,8 @@ general-gaming-AI/
 ## 环境复现步骤
 
 硬件：Windows 11 + NVIDIA RTX 5060（8GB，Blackwell）。以下步骤已在 2026-08-19 实测通过。
+
+> **平台适用性**：本课题验证环境为 Windows + NVIDIA GPU。官方推理代码硬编码 CUDA（`model.to("cuda")`），macOS 与无 NVIDIA 显卡的机器无法直接复现；Linux + NVIDIA GPU 理论上可行但未实测。RTX 50 系需 cu128 版 PyTorch，较老显卡可能需换 cu126 轮子。
 
 ### 1. 克隆本仓库与官方代码
 
@@ -113,9 +116,16 @@ NitroGen\.venv\Scripts\python.exe NitroGen\scripts\play.py --process '<游戏进
 NitroGen\.venv\Scripts\python.exe -c "from huggingface_hub import hf_hub_download; hf_hub_download('nvidia/NitroGen','actions/SHARD_0034.tar.gz',repo_type='dataset')"
 ```
 
-从解压后的分片中按 `metadata.json` 的 `game == "hollow_knight"` 过滤提取标注（每个 chunk 含 `actions_processed.parquet` / `actions_raw.parquet` / `metadata.json`）。
+从分片中提取 Hollow Knight 标注（自动定位 HF 缓存，流式单遍扫描约 3 分钟）：
 
-选定游戏统计（实测，2026-08-19）：Hollow Knight 共 1,444,200 帧 / 1439 chunks / 6 个视频；抽样实测按键触发率 26.0%、左摇杆移动率 39.7%、IDLE 帧占比 49.2%。
+```powershell
+NitroGen\.venv\Scripts\python.exe scripts\extract_hollow_knight.py            # 全量提取
+NitroGen\.venv\Scripts\python.exe scripts\extract_hollow_knight.py --limit 2  # 冒烟验证
+```
+
+产出 `data/hollow_knight/`：`annotations.parquet`（1,444,200 帧 × 17 键 + 左/右摇杆 + 溯源列）、`manifest.json`（chunk 级清单）、`raw/`（1439 个 chunk 原始 parquet）。
+
+选定游戏统计（全量实测，2026-08-20）：Hollow Knight 共 **1,444,200 帧 / 1439 chunks / 6 个视频**；完全 IDLE 帧占比 37.2%，左摇杆移动率 19.2%，任一按键触发率 45.3%；按压最多为 dpad_left / dpad_right / south（跳跃）/ right_trigger；`guide` 键全量恒 0。
 
 ## 关键依赖版本
 

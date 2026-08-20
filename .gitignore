@@ -25,3 +25,6 @@ commit_msg.txt
 # IDE
 .idea/
 .vscode/
+
+# 课程内部指导材料（非交付物，不公开）
+背景信息.md
