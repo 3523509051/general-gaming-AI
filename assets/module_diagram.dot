@@ -1,24 +1,62 @@
 digraph modules {
   rankdir=TB;
-  splines=ortho;
+  splines=spline;
+  bgcolor="white";
+  fontname="Microsoft YaHei";
+  compound=true;
   node [shape=box, style="rounded,filled", fillcolor="#E8F0FE",
-        fontname="Microsoft YaHei", fontsize=12];
-  edge [fontname="Microsoft YaHei"];
+        fontname="Microsoft YaHei", fontsize=13, margin="0.18,0.10"];
+  edge [fontname="Microsoft YaHei", fontsize=11, color="#555555"];
 
   // 外部使用者
-  user [label="复现者 / 研究者\n（验收者）",
-        shape=ellipse, fillcolor="#FDEBD0"];
+  user [label="复现者 / 研究者（验收者）",
+        shape=ellipse, fillcolor="#FDEBD0", fontsize=13];
 
-  // 内部模块（实线 = 主路径）
-  A [label="A 环境与推理\nng.pt → 18步动作块"];
-  B [label="B 数据提取\nSHARD_0034 → 标注"];
-  C [label="C 统计可视化\n分布图 + 序列曲线"];
-  D [label="D 定量评估\n准确率 + 摇杆指标"];
-  E [label="E 归档演示\n指标表 + 报告"];
+  // 准备层（A、B 并列：使用 rank=same 在 cluster 内不冲突，
+  // 因为 cluster 内的 rank 属于 cluster 的 rankset）
+  subgraph cluster_prep {
+    label="准备层：离线产物";
+    labeljust="l";
+    style="rounded,filled";
+    fillcolor="#F5F8FC";
+    color="#B8C5D9";
+    fontname="Microsoft YaHei";
+    fontsize=12;
+    A [label="A 环境与推理\nng.pt → 18 步动作块"];
+    B [label="B 数据提取\nSHARD_0034 → 标注"];
+    {rank=same; A; B;}
+  }
 
-  // 扩展项（虚线）
-  Cx [label="C' 可视化工具（第6天扩展）\n20段曲线 + 差异Top5帧",
-      style="dashed,rounded,filled", fillcolor="#FFFFFF"];
+  // 评估层（C、D 并列）
+  subgraph cluster_eval {
+    label="评估层：离线分析";
+    labeljust="l";
+    style="rounded,filled";
+    fillcolor="#FBF6EC";
+    color="#D9C5A8";
+    fontname="Microsoft YaHei";
+    fontsize=12;
+    D [label="D 定量评估\n准确率 + 摇杆指标"];
+    C [label="C 统计可视化\n分布图 + 序列曲线"];
+    {rank=same; D; C;}
+  }
+
+  // 归档层
+  subgraph cluster_arch {
+    label="归档与演示层";
+    labeljust="l";
+    style="rounded,filled";
+    fillcolor="#EEF6EE";
+    color="#A8C9A8";
+    fontname="Microsoft YaHei";
+    fontsize=12;
+    E [label="E 归档演示\n指标表 + 报告"];
+  }
+
+  // 扩展（虚线，独立挂件）
+  Cx [label="C' 可视化工具（第 6 天扩展）\n20 段曲线 + 差异 Top5 帧",
+      style="dashed,rounded,filled", fillcolor="#FFFFFF",
+      fontsize=11, color="#888888"];
 
   // 依赖方向
   user -> A;
@@ -28,7 +66,7 @@ digraph modules {
   B -> D;
   C -> E;
   D -> E;
-  C -> Cx [style=dashed];
-  D -> Cx [style=dashed];
-  Cx -> E [style=dashed];
+  D -> Cx [style=dashed, color="#888888"];
+  C -> Cx [style=dashed, color="#888888"];
+  Cx -> E [style=dashed, color="#888888"];
 }
