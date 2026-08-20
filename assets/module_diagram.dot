@@ -1,0 +1,34 @@
+digraph modules {
+  rankdir=TB;
+  splines=ortho;
+  node [shape=box, style="rounded,filled", fillcolor="#E8F0FE",
+        fontname="Microsoft YaHei", fontsize=12];
+  edge [fontname="Microsoft YaHei"];
+
+  // 外部使用者
+  user [label="复现者 / 研究者\n（验收者）",
+        shape=ellipse, fillcolor="#FDEBD0"];
+
+  // 内部模块（实线 = 主路径）
+  A [label="A 环境与推理\nng.pt → 18步动作块"];
+  B [label="B 数据提取\nSHARD_0034 → 标注"];
+  C [label="C 统计可视化\n分布图 + 序列曲线"];
+  D [label="D 定量评估\n准确率 + 摇杆指标"];
+  E [label="E 归档演示\n指标表 + 报告"];
+
+  // 扩展项（虚线）
+  Cx [label="C' 可视化工具（第6天扩展）\n20段曲线 + 差异Top5帧",
+      style="dashed,rounded,filled", fillcolor="#FFFFFF"];
+
+  // 依赖方向
+  user -> A;
+  user -> B;
+  A -> D;
+  B -> C;
+  B -> D;
+  C -> E;
+  D -> E;
+  C -> Cx [style=dashed];
+  D -> Cx [style=dashed];
+  Cx -> E [style=dashed];
+}
