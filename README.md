@@ -98,6 +98,17 @@ SMOKE TEST PASSED
 
 即：输入一帧 RGB 图像，模型输出 18 步动作块（每步 21 维按键概率 + 左/右摇杆 x、y）。
 
+**为什么看到 `SMOKE TEST PASSED` 就代表测试通过**：这句是脚本的最后一行，只有前面所有步骤成功、所有断言通过才会执行到它（脚本是"负向验证"——默认会失败，任一环节失败都会在中间抛异常或 `AssertionError` 而中断）。能打印出这句话，意味着以下四件事同时成立：
+
+| 关卡 | 脚本位置 | 验证内容 | 失败表现 |
+| --- | --- | --- | --- |
+| 模型加载 | `[1/3]` `from_ckpt` | 权重、模型结构、依赖环境正常 | `AttributeError` / `FileNotFoundError` 等直接崩溃 |
+| 推理执行 | `[2/3]` `predict` | GPU 可用、显存够、flow-matching 16 步积分正常 | OOM 或运行时错误 |
+| 输出形状 | `[3/3]` 前 3 个 `assert` | `buttons` 为 (18,21)、`j_left`/`j_right` 为 (18,2) | `AssertionError: unexpected ... shape` |
+| 数值范围 | 后 2 个 `assert` | 摇杆取值落在 [-1,1] | `AssertionError: ... out of [-1,1] range` |
+
+**边界**：冒烟测试只验证"能跑通、输出形状对、数值合法"，不验证预测动作的准确率或摇杆相关系数（质量指标由第 5 天的评估脚本负责）。
+
 ### 5. 官方推理服务（可选，接 Windows 游戏实时控制用）
 
 ```powershell
