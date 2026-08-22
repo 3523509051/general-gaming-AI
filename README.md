@@ -164,12 +164,39 @@ NitroGen\.venv\Scripts\python.exe scripts\app.py   # 监听 http://localhost:500
 - 手动分步启动：`Ctrl+C`；若端口被占：
   `Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -like "*app.py*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`
 
-### 推理冒烟测试
+### 推理冒烟测试（可复现验证：安装并加载 ng.pt）
+
+跑通官方 ng.pt 的等价调用（`scripts/smoke_test.py` 内部即官方 `InferenceSession` 加载权重 + 单帧推理）：
 
 ```powershell
 NitroGen\.venv\Scripts\python.exe scripts\smoke_test.py
-# 预期最后一行：SMOKE TEST PASSED
 ```
+
+预期输出（实测值，2026-08-19）：
+
+```
+[1/3] loading model from ng.pt ...
+      model loaded in 11.0s
+[2/3] running predict on a dummy 1280x720 frame ...
+      inference done in 1.0s
+[3/3] outputs:
+      buttons shape: (18, 21)
+      j_left  shape: (18, 2)
+      j_right shape: (18, 2)
+SMOKE TEST PASSED
+```
+
+即：输入一帧 RGB 图像，模型输出 18 步动作块（每步 21 维按键概率 + 左/右摇杆 x、y）。
+
+### 官方推理服务（可选，接 Windows 游戏实时控制用）
+
+```powershell
+NitroGen\.venv\Scripts\python.exe NitroGen\scripts\serve.py NitroGen\ng.pt
+# 另开终端：
+NitroGen\.venv\Scripts\python.exe NitroGen\scripts\play.py --process '<游戏进程名>.exe'
+```
+
+本课题评估离线进行，不依赖此步骤（评估走 `scripts/evaluate.py` 的等价调用）。
 
 ### 数据 / 评估命令行
 
