@@ -7,6 +7,7 @@
 用法（仓库根目录，任意有 Python 的环境均可，无第三方依赖）：
     python scripts/scan_shard.py                          # 自动定位 HF 缓存中的 SHARD_0034
     python scripts/scan_shard.py --shard <tar.gz 路径>     # 显式指定分片
+    python scripts/scan_shard.py --shard <路径> --merge     # 合并到已有 games_scan.json（不覆盖，多切片）
     python scripts/scan_shard.py --out data/games_scan.json
 
 输出（data/games_scan.json）：
@@ -25,28 +26,30 @@ import time
 from pathlib import Path
 
 DATA_ROOT = Path(__file__).resolve().parent.parent / "data"
-HF_SNAPSHOT = Path.home() / ".cache" / "huggingface" / "hub" / "datasets--nvidia--NitroGen" / "snapshots"
+# 切片存放目录（项目内 data/shards/，多切片各自独立文件，不入库）
+SHARDS_DIR = DATA_ROOT / "shards"
 
 
 def resolve_shard_path(explicit: str | None) -> Path:
-    """定位 SHARD_0034.tar.gz（显式路径优先，否则搜索 HF 缓存）。"""
+    """定位 SHARD_*.tar.gz（显式路径优先，否则扫描项目 data/shards/）。"""
     if explicit:
         p = Path(explicit)
         if p.exists():
             return p
         raise FileNotFoundError(explicit)
-    if HF_SNAPSHOT.exists():
-        for snap in sorted(HF_SNAPSHOT.iterdir()):
-            cand = snap / "actions" / "SHARD_0034.tar.gz"
-            if cand.exists():
-                return cand
-    raise FileNotFoundError("未在 HF 缓存中找到 SHARD_0034.tar.gz，请用 --shard 显式指定路径")
+    if SHARDS_DIR.exists():
+        cand = SHARDS_DIR / "SHARD_0034.tar.gz"
+        if cand.exists():
+            return cand
+    raise FileNotFoundError("未在 data/shards/ 中找到 SHARD_0034.tar.gz，请用 --shard 显式指定路径")
 
 
 def main():
     ap = argparse.ArgumentParser(description="一键识别切片含有的游戏与下载链接")
     ap.add_argument("--shard", default=None, help="SHARD_0034.tar.gz 路径（默认自动定位 HF 缓存）")
     ap.add_argument("--out", default=str(DATA_ROOT / "games_scan.json"), help="输出 JSON 路径")
+    ap.add_argument("--merge", action="store_true",
+                    help="合并到已有 games_scan.json（保留其它切片的游戏，不覆盖）")
     args = ap.parse_args()
 
     shard = resolve_shard_path(args.shard)
@@ -100,6 +103,33 @@ def main():
             ],
         }
 
+    # 独立清单：每切片一份 JSON（data/shards/<SHARD>.games.json），分开显示切片内容，不合并
+    shard_name = shard.stem.replace(".tar", "")  # SHARD_0000 / SHARD_0034
+    per_shard = DATA_ROOT / "shards" / f"{shard_name}.games.json"
+    per_shard.parent.mkdir(parents=True, exist_ok=True)
+    with open(per_shard, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+    print(f"[独立清单] 该切片 {len(result)} 个游戏 -> {per_shard.name}")
+
+    # --out / --merge：仍支持输出合并清单（默认 games_scan.json；显式 --merge 时与旧清单聚合）
+    if args.merge and out_path.exists():
+        old = json.load(open(out_path, encoding="utf-8"))
+        merged_games = 0
+        for game, g in result.items():
+            if game in old:
+                o = old[game]
+                # 按 video 合并：新增 urls 不重复，聚合数量
+                seen = {u["video"] for u in o.get("urls", [])}
+                new_urls = [u for u in g["urls"] if u["video"] not in seen]
+                o["videos"] = len(seen | {u["video"] for u in g["urls"]})
+                o["chunks"] = int(o.get("chunks", 0)) + int(g["chunks"])
+                o["frames"] = int(o.get("frames", 0)) + int(g["frames"])
+                o.setdefault("urls", []).extend(new_urls)
+            else:
+                old[game] = g
+                merged_games += 1
+        result = old
+        print(f"[merge] 合并完成：新增 {merged_games} 个游戏，更新 {len(result)} 个游戏")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
 

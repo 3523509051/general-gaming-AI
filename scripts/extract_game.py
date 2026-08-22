@@ -5,6 +5,8 @@
     NitroGen\\.venv\\Scripts\\python.exe scripts\\extract_game.py --game hades           # 全量提取 hades
     NitroGen\\.venv\\Scripts\\python.exe scripts\\extract_game.py --game hollow_knight  # 全量提取 hollow_knight
     NitroGen\\.venv\\Scripts\\python.exe scripts\\extract_game.py --game hades --limit 2  # 冒烟验证
+    NitroGen\\.venv\\Scripts\\python.exe scripts\\extract_game.py --game hades --shard <tar.gz 路径>  # 显式指定切片
+    # 默认自动发现 HF 缓存中全部 SHARD_*.tar.gz，逐个扫描（目标游戏可能跨切片）
 
 设计要点（见 第2天报告.md「动作对齐关系与指标口径」）：
 1. 数据源：HF 缓存中 SHARD_0034.tar.gz（符号链接解析到 blobs 实际文件）；
@@ -37,24 +39,28 @@ BUTTON_COLS = [
 ]
 TARGET_GAME = "hades"
 
-# SHARD_0034 在 HuggingFace 缓存中的位置（snapshot 符号链接 -> blobs 实体）
-HF_SNAPSHOT = Path.home() / ".cache" / "huggingface" / "hub" / "datasets--nvidia--NitroGen" / "snapshots"
+# 切片存放目录（项目内 data/shards/，多切片各自独立文件）
+SHARDS_DIR = Path(__file__).resolve().parent.parent / "data" / "shards"
 DATA_ROOT = Path(__file__).resolve().parent.parent / "data"
 
 
-def resolve_shard_path(explicit: str | None) -> Path:
-    """定位 SHARD_0034.tar.gz（支持直接传路径或自动搜索 HF 缓存）。"""
+def resolve_shard_paths(explicit: str | None) -> list[Path]:
+    """定位切片文件（支持显式路径或自动搜索 HF 缓存全部 SHARD_*.tar.gz）。
+
+    返回列表：显式路径给单个；自动发现给全部本地切片（目标游戏可能跨切片）。
+    """
     if explicit:
         p = Path(explicit)
         if p.exists():
-            return p
+            return [p]
         raise FileNotFoundError(explicit)
-    if HF_SNAPSHOT.exists():
-        for snap in sorted(HF_SNAPSHOT.iterdir()):
-            cand = snap / "actions" / "SHARD_0034.tar.gz"
-            if cand.exists():
-                return cand  # 符号链接，tarfile 可直接跟随
-    raise FileNotFoundError("未在 HF 缓存中找到 SHARD_0034.tar.gz，请用 --shard 显式指定路径")
+    found = []
+    if SHARDS_DIR.exists():
+        for tar in sorted(SHARDS_DIR.glob("SHARD_*.tar.gz")):
+            found.append(tar)
+    if not found:
+        raise FileNotFoundError("未在 data/shards/ 中找到任何 SHARD_*.tar.gz，请用 --shard 显式指定路径")
+    return found
 
 
 def summarize_chunk(video: str, chunk: str, data: bytes, meta: dict) -> dict:
@@ -79,25 +85,24 @@ def summarize_chunk(video: str, chunk: str, data: bytes, meta: dict) -> dict:
 
 def main():
     ap = argparse.ArgumentParser(description="从 SHARD_0034 提取指定游戏的手柄标注")
-    ap.add_argument("--shard", default=None, help="SHARD_0034.tar.gz 路径（默认自动定位 HF 缓存）")
+    ap.add_argument("--shard", default=None, help="SHARD_*.tar.gz 路径（默认自动发现 HF 缓存全部切片）")
     ap.add_argument("--game", default=TARGET_GAME, help=f"要提取的游戏名（默认 {TARGET_GAME}）")
     ap.add_argument("--video", default=None, help="只提取指定 video_id（可选，默认全部）")
     ap.add_argument("--limit", type=int, default=None, help="最多提取的 chunk 数（冒烟验证用）")
     args = ap.parse_args()
 
-    shard = resolve_shard_path(args.shard)
+    shards = resolve_shard_paths(args.shard)
     # 输出目录按游戏动态命名，避免不同游戏互相覆盖
     OUT_ROOT = DATA_ROOT / args.game
-    print(f"shard : {shard}")
+    print(f"shards: {[s.name for s in shards]}")
     print(f"game  : {args.game}")
     print(f"out   : {OUT_ROOT}")
     (OUT_ROOT / "raw").mkdir(parents=True, exist_ok=True)
 
-    manifest = {"shard": str(shard), "game": args.game, "videos": {}, "chunks": []}
-    video_game: dict[str, str | None] = {}    # video -> game（读到 metadata 后填充）
+    manifest = {"shard": [s.name for s in shards], "game": args.game, "videos": {}, "chunks": []}
+    video_game: dict[str, str | None] = {}    # video -> game（读到 metadata 后填充，跨切片保留）
     chunk_meta: dict[str, dict] = {}          # "video|chunk" -> metadata 摘要
     processed_seen: set[str] = set()          # "video|chunk" 有 actions_processed.parquet
-    pending: dict[str, dict[str, bytes]] = {} # video -> {chunk: parquet bytes}（game 未知时缓存）
     n_extracted = 0
     n_members = 0
 
@@ -113,60 +118,74 @@ def main():
         if n_extracted == 1 or n_extracted % 10 == 0:
             print(f"  extracted {n_extracted} chunks ...", flush=True)
 
-    with tarfile.open(shard, "r:gz") as tf:
-        for m in tf:
-            n_members += 1
-            parts = m.name.split("/")
-            if len(parts) != 4:
-                continue
-            _, video, chunk, fname = parts
-            # 视频过滤：指定了 --video 时只处理该视频
-            video_ok = args.video is None or video == args.video
+    def extract_one_shard(shard: Path) -> None:
+        """扫描单个切片：把目标游戏的 chunk 提取到 OUT_ROOT/raw/ 并登记 manifest。
 
-            if fname == "metadata.json":
-                meta = json.load(io.TextIOWrapper(tf.extractfile(m), encoding="utf-8"))
-                game = meta.get("game")
-                video_game.setdefault(video, game)
-                if game == args.game and video_ok:
-                    ov = meta["original_video"]
-                    chunk_meta[f"{video}|{chunk}"] = {
-                        "url": ov.get("url"),
-                        "start_frame": ov.get("start_frame"),
-                        "end_frame": ov.get("end_frame"),
-                    }
-                    # 不依赖 chunk_0000：任何目标游戏的 metadata 都可登记视频
-                    # （部分视频缺少 chunk_0000 或其 metadata，此前按 chunk_0000 统计会漏）
-                    manifest["videos"].setdefault(
-                        video,
-                        {
-                            "game": game,
+        跨切片协调：video_game/chunk_meta/processed_seen 跨切片累积——
+        若目标游戏的 chunk 分布在多个切片（罕见但支持），后扫切片能识别已登记的 video。
+        pending 仅用于处理单切片内 parquet 先于 metadata 到达的情况。
+        """
+        nonlocal n_members
+        pending: dict[str, dict[str, bytes]] = {}  # video -> {chunk: parquet bytes}
+        with tarfile.open(shard, "r:gz") as tf:
+            for m in tf:
+                n_members += 1
+                parts = m.name.split("/")
+                if len(parts) != 4:
+                    continue
+                _, video, chunk, fname = parts
+                # 视频过滤：指定了 --video 时只处理该视频
+                video_ok = args.video is None or video == args.video
+
+                if fname == "metadata.json":
+                    meta = json.load(io.TextIOWrapper(tf.extractfile(m), encoding="utf-8"))
+                    game = meta.get("game")
+                    video_game.setdefault(video, game)
+                    if game == args.game and video_ok:
+                        ov = meta["original_video"]
+                        chunk_meta[f"{video}|{chunk}"] = {
                             "url": ov.get("url"),
-                            "source": ov.get("source"),
-                            "resolution": ov.get("resolution"),
-                            "controller_type": meta.get("controller_type"),
-                        },
-                    )
-                # metadata 到达 -> 该视频 game 已知，处理 pending 中缓存的 parquet
-                if video in pending:
-                    for pchunk, pdata in pending.pop(video).items():
-                        if game == args.game and video_ok:
-                            save_chunk(video, pchunk, pdata)
-                continue
+                            "start_frame": ov.get("start_frame"),
+                            "end_frame": ov.get("end_frame"),
+                        }
+                        # 不依赖 chunk_0000：任何目标游戏的 metadata 都可登记视频
+                        # （部分视频缺少 chunk_0000 或其 metadata，此前按 chunk_0000 统计会漏）
+                        manifest["videos"].setdefault(
+                            video,
+                            {
+                                "game": game,
+                                "url": ov.get("url"),
+                                "source": ov.get("source"),
+                                "resolution": ov.get("resolution"),
+                                "controller_type": meta.get("controller_type"),
+                            },
+                        )
+                    # metadata 到达 -> 该视频 game 已知，处理 pending 中缓存的 parquet
+                    if video in pending:
+                        for pchunk, pdata in pending.pop(video).items():
+                            if game == args.game and video_ok:
+                                save_chunk(video, pchunk, pdata)
+                    continue
 
-            if fname == "actions_processed.parquet":
-                if video_game.get(video) == args.game and video_ok:
-                    processed_seen.add(f"{video}|{chunk}")
-                continue
+                if fname == "actions_processed.parquet":
+                    if video_game.get(video) == args.game and video_ok:
+                        processed_seen.add(f"{video}|{chunk}")
+                    continue
 
-            if fname != "actions_raw.parquet":
-                continue
+                if fname != "actions_raw.parquet":
+                    continue
 
-            # actions_raw.parquet 成员
-            if video in video_game:  # game 已知（非首个 chunk）
-                if video_game[video] == args.game and video_ok:
-                    save_chunk(video, chunk, tf.extractfile(m).read())
-            else:  # 首个 chunk 的 parquet 先于 metadata 出现：缓存待定
-                pending.setdefault(video, {})[chunk] = tf.extractfile(m).read()
+                # actions_raw.parquet 成员
+                if video in video_game:  # game 已知（非首个 chunk，可能来自之前切片）
+                    if video_game[video] == args.game and video_ok:
+                        save_chunk(video, chunk, tf.extractfile(m).read())
+                else:  # 首个 chunk 的 parquet 先于 metadata 出现：缓存待定
+                    pending.setdefault(video, {})[chunk] = tf.extractfile(m).read()
+
+    # 多切片：逐个扫描（video_game 跨切片保留，pending 每切片独立）
+    for shard in shards:
+        print(f"\n=== 扫描切片: {shard.name} ===")
+        extract_one_shard(shard)
 
     # 回填 has_processed 与 metadata 信息（parquet 成员先于同 chunk 的 metadata.json 出现）
     for c in manifest["chunks"]:

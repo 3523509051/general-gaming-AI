@@ -59,6 +59,10 @@ function syncURL() {
 // ---------------- 初始化 ----------------
 window.addEventListener("DOMContentLoaded", async () => {
   await loadGames();
+  setupShardDropzone();   // 初始化切片拖拽导入
+  // 指标条帧数输入：用户手动改过就标记，避免被当前帧数覆盖
+  const tsi = document.getElementById("testSizeInput2");
+  if (tsi) tsi.addEventListener("input", () => { tsi.dataset.userEdited = "1"; });
   // 若后台仍有探测/下载任务在跑，恢复进度轮询
   try {
     const st = await api("/api/rescan/status");
@@ -93,14 +97,25 @@ async function loadGames() {
     state.games = d.games;
     const sel = document.getElementById("gameSelect");
     sel.innerHTML = "";
+    // 按切片分组（optgroup），未归类的游戏进"其它"
+    const groups = {};
     for (const g of d.games) {
-      const o = document.createElement("option");
-      o.value = g.game;
-      const flags = [];
-      if (g.tested) flags.push("已测");
-      else if (g.ready_videos > 0) flags.push("可测");
-      o.textContent = `${g.game}（${g.videos} 视频 / 录像约 ${fmtDuration(g.video_seconds)}${flags.length ? " · " + flags.join("·") : ""}）`;
-      sel.appendChild(o);
+      const key = g.shard || "其它";
+      (groups[key] = groups[key] || []).push(g);
+    }
+    for (const [shard, gs] of Object.entries(groups)) {
+      const og = document.createElement("optgroup");
+      og.label = shard;
+      for (const g of gs) {
+        const o = document.createElement("option");
+        o.value = g.game;
+        const flags = [];
+        if (g.tested) flags.push("已测");
+        else if (g.ready_videos > 0) flags.push("可测");
+        o.textContent = `${g.game}（${g.videos} 视频 / 录像约 ${fmtDuration(g.video_seconds)}${flags.length ? " · " + flags.join("·") : ""}）`;
+        og.appendChild(o);
+      }
+      sel.appendChild(og);
     }
     sel.disabled = false;
     // 保留当前选中（重建 option 后 value 会丢，需恢复；兼容 state.game 已设置的情况）
@@ -197,6 +212,12 @@ async function loadMetricsBanner() {
     const shiftLabel = shift === "auto" ? `shift k=${d.best_shift}(最优)` : `shift k=${shift}`;
     document.getElementById("metricsScope").textContent =
       `${d.game} / ${d.video} · ${d.metrics.test_frames ?? d.test_frames} 帧 · ${shiftLabel}`;
+    // 同步"重新评估"帧数输入框的当前值（便于改帧数后重跑）
+    const tsi = document.getElementById("testSizeInput2");
+    if (tsi) {
+      const cur = d.metrics.test_frames ?? d.test_frames;
+      if (cur && !tsi.dataset.userEdited) tsi.value = cur;
+    }
     const m = d.metrics, ref = d.reference, v = d.verdicts;
     const chips = [
       { label: "按键一致率(逐帧全对)", value: (m.acc_17keys * 100).toFixed(1) + "%",
@@ -675,8 +696,13 @@ function renderEvalGuide() {
       <div class="eval-guide-icon">🧪</div>
       <div class="eval-guide-body">
         <h4>该视频尚未评估，序列对比需要评估产物（predictions.csv）</h4>
-        <p>评估流程：抽 200 帧测试集 → 加载 NitroGen 模型逐帧推理 → shift 扫描对齐 → 生成对比数据并入库。
+        <p>评估流程：抽测试集帧 → 加载 NitroGen 模型逐帧推理 → shift 扫描对齐 → 生成对比数据并入库。
            预计耗时 3~6 分钟（含模型加载），后台运行。</p>
+        <div class="eval-guide-form">
+          <label for="testSizeInput">测试集帧数：</label>
+          <input id="testSizeInput" type="number" min="10" max="5000" step="10" value="200">
+          <span class="muted">改完后点下方按钮按新帧数评估</span>
+        </div>
         ${downloaded ? `
           <p class="eval-guide-warn">前置条件已满足（视频已下载）。</p>
           <button class="primary-btn" onclick="triggerEvaluate()">运行评估（约 3~6 分钟）</button>`
@@ -690,12 +716,37 @@ function renderEvalGuide() {
 async function triggerEvaluate() {
   if (!state.game || !state.video) return;
   try {
-    const r = await fetch(`/api/evaluate?game=${encodeURIComponent(state.game)}&video=${encodeURIComponent(state.video)}`, { method: "POST" });
+    // 读取前端帧数输入（默认 200；留空则后端用默认）
+    const inp = document.getElementById("testSizeInput");
+    const testSize = inp ? inp.value.trim() : "";
+    const params = [`game=${encodeURIComponent(state.game)}`, `video=${encodeURIComponent(state.video)}`];
+    if (testSize) params.push(`test_size=${encodeURIComponent(testSize)}`);
+    const r = await fetch(`/api/evaluate?${params.join("&")}`, { method: "POST" });
     const j = await r.json();
     if (!j.ok) { showError(j.error || "评估启动失败"); return; }
     document.getElementById("seqChart").innerHTML =
       `<div class="loading-block"><div class="spinner"></div>评估已启动，正在后台运行…</div>`;
     showEvalLog(true);
+    pollEvaluate();
+  } catch (e) { showError("评估启动失败: " + e.message); }
+}
+
+// 指标条"重新评估"：读取帧数输入框并启动（已评估/未评估均可）
+async function triggerEvaluateFromMetrics() {
+  if (!state.game || !state.video) { showError("请先选择游戏和视频"); return; }
+  const inp = document.getElementById("testSizeInput2");
+  const val = inp ? inp.value.trim() : "";
+  const n = parseInt(val, 10);
+  if (!n || n < 10 || n > 5000) { showError("测试集帧数应在 10~5000 之间"); return; }
+  if (inp) inp.dataset.userEdited = "1";
+  const params = [`game=${encodeURIComponent(state.game)}`, `video=${encodeURIComponent(state.video)}`, `test_size=${n}`];
+  try {
+    const r = await fetch(`/api/evaluate?${params.join("&")}`, { method: "POST" });
+    const j = await r.json();
+    if (!j.ok) { showError(j.error || "评估启动失败"); return; }
+    showEvalLog(true);
+    document.getElementById("seqChart").innerHTML =
+      `<div class="loading-block"><div class="spinner"></div>已按 ${n} 帧启动评估，正在后台运行…</div>`;
     pollEvaluate();
   } catch (e) { showError("评估启动失败: " + e.message); }
 }
@@ -880,6 +931,116 @@ function updateExtractBanner(st) {
     }
     if (st.log_tail) { logEl.textContent = st.log_tail; logEl.classList.remove("hidden"); }
     else logEl.classList.add("hidden");
+  }
+}
+
+// ---- 导入本地切片（多切片支持）----
+let _selectedShard = null;
+
+function refreshShardList() {
+  const list = document.getElementById("shardList");
+  const btn = document.getElementById("shardScanBtn");
+  list.innerHTML = '<span class="muted">加载中…</span>';
+  btn.disabled = true;
+  _selectedShard = null;
+  fetch("/api/shaders")
+    .then(r => r.json())
+    .then(j => {
+      if (!j.ok) { list.innerHTML = `<span class="err">加载失败: ${j.error || ""}</span>`; return; }
+      const shards = j.data.shards || [];
+      if (!shards.length) {
+        list.innerHTML = `<span class="muted">未发现本地切片。把 SHARD_*.tar.gz 拖到上方区域即可导入。</span>`;
+        return;
+      }
+      // 分开显示每个切片内容：扫描过的显示游戏/视频数，未扫描的提示先扫描
+      list.innerHTML = shards.map(s =>
+        `<label class="shard-item"><input type="radio" name="shard" value="${s.path}" data-name="${s.name}">
+          <span><b>${s.name}</b></span>
+          <span class="muted">${s.size_mb} MB · ${s.scanned ? `已扫描 ${s.games_count} 游戏 / ${s.videos_count} 视频` : "未扫描（勾选后「扫描选中切片」）"}</span></label>`
+      ).join("");
+      list.querySelectorAll('input[name="shard"]').forEach(rb => {
+        rb.addEventListener("change", () => {
+          _selectedShard = rb.value;
+          btn.disabled = false;
+        });
+      });
+    })
+    .catch(() => list.innerHTML = '<span class="err">加载失败</span>');
+}
+
+function openShardModal() {
+  document.getElementById("shardModal").classList.remove("hidden");
+  document.getElementById("shardLog").classList.add("hidden");
+  refreshShardList();
+}
+
+function closeShardModal() { document.getElementById("shardModal").classList.add("hidden"); }
+
+// ---- 拖拽 / 点击上传切片 ----
+function setupShardDropzone() {
+  const dz = document.getElementById("shardDropZone");
+  const input = document.getElementById("shardFileInput");
+  if (!dz || dz.dataset.bound) return;
+  dz.dataset.bound = "1";
+  dz.addEventListener("click", () => input.click());
+  input.addEventListener("change", () => {
+    if (input.files.length) uploadShard(input.files[0]);
+    input.value = "";
+  });
+  ["dragenter", "dragover"].forEach(ev =>
+    dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.add("dragover"); }));
+  ["dragleave", "drop"].forEach(ev =>
+    dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.remove("dragover"); }));
+  dz.addEventListener("drop", e => {
+    const f = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) uploadShard(f);
+  });
+}
+
+async function uploadShard(file) {
+  const dz = document.getElementById("shardDropZone");
+  const list = document.getElementById("shardList");
+  const orig = dz.innerHTML;
+  dz.classList.add("dragover");
+  dz.innerHTML = `正在复制 ${file.name}（${(file.size / 1024 / 1024).toFixed(1)} MB）…`;
+  try {
+    const form = new FormData();
+    form.append("file", file);
+    const r = await fetch("/api/upload_shard", { method: "POST", body: form });
+    const j = await r.json();
+    if (!j.ok) {
+      dz.innerHTML = `✕ ${j.error || "上传失败"}`;
+      dz.style.color = "var(--red)";
+      return;
+    }
+    dz.innerHTML = `✓ ${file.name} 已复制到 data/shards/`;
+    dz.style.color = "var(--primary)";
+    refreshShardList();   // 列表立即显示新切片
+  } catch (e) {
+    dz.innerHTML = `✕ 上传失败: ${e.message}`;
+    dz.style.color = "var(--red)";
+  }
+  setTimeout(() => { dz.innerHTML = orig; dz.style.color = ""; dz.classList.remove("dragover"); }, 4000);
+}
+
+async function scanSelectedShard() {
+  if (!_selectedShard) return;
+  const btn = document.getElementById("shardScanBtn");
+  const logEl = document.getElementById("shardLog");
+  btn.disabled = true; btn.textContent = "扫描中…（可能 1~3 分钟）";
+  logEl.classList.remove("hidden");
+  logEl.textContent = "扫描切片并生成独立清单中，请稍候…";
+  try {
+    const r = await fetch(`/api/scan_shard?shard=${encodeURIComponent(_selectedShard)}`, { method: "POST" });
+    const j = await r.json();
+    if (!j.ok) { logEl.textContent = "失败: " + (j.error || ""); btn.textContent = "重试"; btn.disabled = false; return; }
+    logEl.textContent = "扫描完成 ✓  " + (j.data.tail || "");
+    btn.textContent = "完成";
+    await loadGames();   // 刷新游戏清单（新游戏出现）
+    refreshShardList();  // 更新该切片"已扫描"状态
+  } catch (e) {
+    logEl.textContent = "失败: " + e.message;
+    btn.textContent = "重试"; btn.disabled = false;
   }
 }
 

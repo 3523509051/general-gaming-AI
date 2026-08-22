@@ -24,6 +24,7 @@
 import csv
 import json
 import math
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -239,6 +240,13 @@ def assert_lineage(game: str, video: str, frame: int | None = None):
 def api_games():
     scan = load_json(GAMES_SCAN, {})
     tested = {(r["game"], r["video"]) for r in db_query("SELECT game, video FROM eval_results")}
+    # 游戏 -> 所属切片（从各切片独立清单计算；同名游戏跨切片时归首个切片）
+    game_shard: dict[str, str] = {}
+    shards_dir = DATA_ROOT / "shards"
+    if shards_dir.exists():
+        for jf in sorted(shards_dir.glob("SHARD_*.games.json")):
+            for g in load_json(jf, {}).keys():
+                game_shard.setdefault(g, jf.name[:-len(".games.json")])  # SHARD_0000.games.json -> SHARD_0000
     games = []
     for game, info in scan.items():
         dl = downloaded_videos(game)
@@ -250,14 +258,15 @@ def api_games():
             "videos": info.get("videos", 0),
             "frames": info.get("frames", 0),
             "chunks": chunks,
+            "shard": game_shard.get(game, ""),   # 所属切片（前端按此分组）
             # 每个 chunk 固定 20 秒（metadata duration=20）→ 总时长估算
             "video_seconds": chunks * 20,
             "ready_videos": len(dl),
             "extracted": has_manifest,
             "tested": game_tested,
         })
-    # 排序：已提取 > 已下载 > 其余，再按 chunks 降序
-    games.sort(key=lambda g: (not g["extracted"], -g["ready_videos"], -g["chunks"]))
+    # 排序：按切片 → 已提取 > 已下载 > 其余，再按 chunks 降序
+    games.sort(key=lambda g: (g["shard"], not g["extracted"], -g["ready_videos"], -g["chunks"]))
     return ok({"games": games})
 
 
@@ -539,6 +548,12 @@ def api_metrics():
     if row is None:
         return err(f"「{game}/{video}」尚未评估，请先在 Tab③ 运行评估", 404)
 
+    # 测试集帧数以「实际测试集 CSV 行数」为准（重新评估/改帧数后自动跟随，而非 DB 历史快照）
+    try:
+        real_frames = len(get_testset(game, video))
+    except Exception:  # noqa: BLE001
+        real_frames = int(row["test_frames"])
+
     # 读 metrics 明细（shift 0~17 全行，优先按视频隔离文件）
     import csv as _csv
     metrics_rows = []
@@ -585,7 +600,7 @@ def api_metrics():
     return ok({
         "game": game,
         "video": video,
-        "test_frames": row["test_frames"],
+        "test_frames": real_frames,
         "best_shift": row["best_shift"],
         "shift": shift,
         "metrics": {
@@ -604,7 +619,7 @@ def api_metrics():
         },
         # 供前端直白展示的文案
         "display": {
-            "test_frames": f"测试集 {row['test_frames']} 帧",
+            "test_frames": f"测试集 {real_frames} 帧",
             "acc": f"按键一致率 {acc*100:.1f}%  vs 参考 50%"
                    + ("  ✅ 达标" if acc >= REFERENCE["acc_17keys"] else "  ❌ 未达"),
             "corr": f"摇杆相关系数 {corr:.2f}  vs 参考 0.40"
@@ -822,13 +837,17 @@ def api_extract_cancel():
 
 @app.post("/api/extract")
 def api_extract():
-    """触发后台任务：仅读取本地 SHARD 分片并提取该游戏标注（不联网）。"""
+    """触发后台任务：仅读取本地 SHARD 分片并提取该游戏标注（不联网）。
+
+    可选参数 shard：指定切片 tar.gz 路径（默认自动发现 HF 缓存全部 SHARD_*.tar.gz）。
+    """
     game = request.args.get("game", "").strip()
+    shard = request.args.get("shard", "").strip() or None
     if not game:
         return err("参数 game 必填")
     scan = load_json(GAMES_SCAN, {})
     if game not in scan:
-        return err(f"未知游戏 '{game}'（不在 SHARD_0034 切片清单中）", 404)
+        return err(f"未知游戏 '{game}'（不在切片清单中）", 404)
     if not CKPT.parent.exists():
         return err("NitroGen 目录不可用", 500)
 
@@ -839,8 +858,94 @@ def api_extract():
                          log_tail="", error=None,
                          started_at=time.strftime("%H:%M:%S"))
 
-    threading.Thread(target=_run_pipeline, args=(game,), daemon=True).start()
+    threading.Thread(target=_run_pipeline, args=(game, shard), daemon=True).start()
     return jsonify({"ok": True, "data": {"status": "started", "game": game}}), 202
+
+
+@app.get("/api/shaders")
+def api_shaders():
+    """列出项目 data/shards/ 中的全部切片（SHARD_*.tar.gz）——供 Web 端选择要导入的切片。
+
+    每个切片附加其独立清单（data/shards/<SHARD>.games.json）的游戏数与视频数，
+    让各切片内容分开显示（不合并）。
+    """
+    shards_dir = DATA_ROOT / "shards"
+    found = []
+    if shards_dir.exists():
+        for tar in sorted(shards_dir.glob("SHARD_*.tar.gz")):
+            try:
+                size_mb = tar.stat().st_size / 1024 / 1024
+            except OSError:
+                size_mb = 0
+            # 该切片的独立清单（若已扫描）：分开显示其游戏/视频数
+            games_json = shards_dir / f"{tar.name[:-7]}.games.json"  # SHARD_0000.tar.gz -> SHARD_0000
+            games_count = None
+            videos_count = None
+            if games_json.exists():
+                g = load_json(games_json, {})
+                games_count = len(g)
+                videos_count = sum(int(v.get("videos", 0)) for v in g.values())
+            found.append({
+                "name": tar.name,
+                "path": str(tar),
+                "size_mb": round(size_mb, 1),
+                "scanned": games_count is not None,
+                "games_count": games_count,
+                "videos_count": videos_count,
+            })
+    return ok({"shards": found})
+
+
+@app.post("/api/scan_shard")
+def api_scan_shard():
+    """扫描指定切片，生成该切片的独立清单（data/shards/<SHARD>.games.json）。
+
+    多切片分开显示：每个切片单独一份清单，不合并到 games_scan.json。
+    参数 shard：tar.gz 完整路径。
+    """
+    shard = request.args.get("shard", "").strip()
+    if not shard:
+        return err("参数 shard 必填")
+    if not os.path.exists(shard):
+        return err(f"切片文件不存在: {shard}", 404)
+    py = sys.executable
+    scan_script = REPO / "scripts" / "scan_shard.py"
+    try:
+        # --merge：扫描生成该切片独立清单的同时，合并进 games_scan.json（全局游戏列表）。
+        # 不加 --merge 会把 games_scan.json 覆盖成单切片内容，导致 Web 下拉游戏变少。
+        r = subprocess.run(
+            [py, str(scan_script), "--shard", shard, "--merge",
+             "--out", str(GAMES_SCAN)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=600,
+        )
+        if r.returncode != 0:
+            return err(f"scan_shard.py 失败: {(r.stderr or r.stdout)[-300:]}", 500)
+        clear_cache("")
+        return ok({"scanned": True, "tail": (r.stdout or "")[-200:]})
+    except subprocess.TimeoutExpired:
+        return err("扫描超时（切片过大）", 500)
+
+
+@app.post("/api/upload_shard")
+def api_upload_shard():
+    """拖拽上传切片：识别 SHARD_*.tar.gz 并复制到 data/shards/（不覆盖同名）。"""
+    f = request.files.get("file")
+    if f is None or not f.filename:
+        return err("未收到文件", 400)
+    name = os.path.basename(f.filename)  # 防路径穿越
+    if not (name.startswith("SHARD_") and name.endswith(".tar.gz")):
+        return err(f"文件名应为 SHARD_*.tar.gz，收到: {name}", 400)
+    shards_dir = DATA_ROOT / "shards"
+    shards_dir.mkdir(parents=True, exist_ok=True)
+    dest = shards_dir / name
+    if dest.exists():
+        return err(f"切片已存在: {name}（data/shards/），无需重复导入", 409)
+    try:
+        f.save(str(dest))
+    except Exception as e:  # noqa: BLE001
+        return err(f"保存失败: {str(e)[:150]}", 500)
+    return ok({"name": name, "path": str(dest)})
 
 
 def _spawn(cmd: list[str], log: Path) -> subprocess.Popen:
@@ -861,14 +966,18 @@ def _wait(proc: subprocess.Popen, log: Path) -> int:
     return rc
 
 
-def _run_pipeline(game: str):
-    """后台线程：仅读取本地分片（extract_game.py 提取标注），不碰网络。"""
+def _run_pipeline(game: str, shard: str | None = None):
+    """后台线程：仅读取本地分片（extract_game.py 提取标注），不碰网络。
+
+    shard 可选：指定切片 tar.gz 路径，None 时 extract_game.py 自动发现全部本地切片。
+    """
     try:
         # --- 阶段 1：读取本地分片并提取标注 ---
         log1 = DATA_ROOT / f"extract_{game}.log"
-        rc = _wait(_spawn(
-            [sys.executable, str(REPO / "scripts" / "extract_game.py"), "--game", game],
-            log1), log1)
+        cmd = [sys.executable, str(REPO / "scripts" / "extract_game.py"), "--game", game]
+        if shard:
+            cmd += ["--shard", shard]
+        rc = _wait(_spawn(cmd, log1), log1)
         if rc != 0:
             raise RuntimeError(f"extract_game.py 失败（退出码 {rc}），日志: data/extract_{game}.log")
 
@@ -1060,7 +1169,8 @@ def api_genplots_status():
 # 让新视频的「序列对比」自动生成。与提取/探测/下载互斥（单任务槽）。
 # --------------------------------------------------------------------------
 _eval_task = {"running": False, "game": None, "video": None, "stage": "idle",
-              "log_tail": "", "error": None, "started_at": None, "proc": None}
+              "log_tail": "", "error": None, "started_at": None, "proc": None,
+              "test_size": None}
 _eval_lock = threading.Lock()
 
 
@@ -1087,6 +1197,16 @@ def api_evaluate():
     video = request.args.get("video", "").strip()
     if not game or not video:
         return err("参数 game/video 必填")
+    # 可选 test_size：前端评估引导可调帧数（默认 evaluate.py 的 200）
+    test_size_raw = request.args.get("test_size", "").strip()
+    test_size = None
+    if test_size_raw:
+        try:
+            test_size = int(test_size_raw)
+            if test_size < 10 or test_size > 5000:
+                return err("test_size 应在 10~5000 之间", 400)
+        except ValueError:
+            return err("test_size 必须是整数", 400)
     assert_lineage(game, video)  # 需已提取（有 manifest + annotations）
     if not (DATA_ROOT / "videos" / f"{game}_{video}.mp4").exists():
         return err("该视频未下载，评估需要本地视频文件。请先用「下载视频」下载。", 400)
@@ -1102,18 +1222,21 @@ def api_evaluate():
         if _eval_task["running"]:
             return err("已有评估任务在运行，请稍候", 409)
         _eval_task.update(running=True, game=game, video=video, stage="evaluating",
-                          log_tail="", error=None,
+                          log_tail="", error=None, test_size=test_size,
                           started_at=time.strftime("%H:%M:%S"), proc=None)
-    threading.Thread(target=_run_evaluate, args=(game, video, fps), daemon=True).start()
+    threading.Thread(target=_run_evaluate, args=(game, video, fps, test_size), daemon=True).start()
     return jsonify({"ok": True, "data": {"status": "started", "game": game,
-                                         "video": video, "fps": fps}}), 202
+                                         "video": video, "fps": fps,
+                                         "test_size": test_size}}), 202
 
 
-def _run_evaluate(game: str, video: str, fps: int):
+def _run_evaluate(game: str, video: str, fps: int, test_size: int | None = None):
     log = DATA_ROOT / f"evaluate_{game}_{video}.log"
     try:
         cmd = [sys.executable, str(REPO / "scripts" / "evaluate.py"),
                "--game", game, "--video", video, "--fps", str(fps)]
+        if test_size is not None:
+            cmd += ["--test-size", str(test_size)]
         proc = subprocess.Popen(cmd, cwd=str(REPO),
                                 stdout=open(log, "w", encoding="utf-8"),
                                 stderr=subprocess.STDOUT)
