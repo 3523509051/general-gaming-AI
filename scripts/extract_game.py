@@ -1,21 +1,22 @@
 # -*- coding: utf-8 -*-
-"""从 SHARD_0034 分片提取 Hollow Knight 手柄标注（第 3 天数据提取主脚本，第 2 天完成框架搭建）。
+"""从 SHARD_0034 分片提取指定游戏的手柄标注（通用脚本）。
 
 用法（仓库根目录）：
-    NitroGen\\.venv\\Scripts\\python.exe scripts\\extract_hollow_knight.py            # 全量提取
-    NitroGen\\.venv\\Scripts\\python.exe scripts\\extract_hollow_knight.py --limit 2  # 冒烟验证（仅前 2 个 chunk）
+    NitroGen\\.venv\\Scripts\\python.exe scripts\\extract_game.py --game hades           # 全量提取 hades
+    NitroGen\\.venv\\Scripts\\python.exe scripts\\extract_game.py --game hollow_knight  # 全量提取 hollow_knight
+    NitroGen\\.venv\\Scripts\\python.exe scripts\\extract_game.py --game hades --limit 2  # 冒烟验证
 
 设计要点（见 第2天报告.md「动作对齐关系与指标口径」）：
 1. 数据源：HF 缓存中 SHARD_0034.tar.gz（符号链接解析到 blobs 实际文件）；
-2. 只提取 game == "hollow_knight" 的 chunk 的 actions_raw.parquet（口径统一，全量可得）；
+2. 只提取 game == <目标游戏> 的 chunk 的 actions_raw.parquet（口径统一，全量可得）；
    actions_processed.parquet 是否存在记录进 manifest（has_processed），但提取不混用；
 3. tar 成员顺序注意：每个 chunk 目录内 actions_raw.parquet 在 metadata.json 之前，
    而 game 字段在 metadata.json 中 —— 首个 chunk 的 parquet 先缓存（pending），
    读到 metadata 确认 game 后再决定写盘或丢弃；
-4. 输出：
-   data/hollow_knight/raw/<video_id>/<chunk_id>.parquet  每chunk一份原始标注
-   data/hollow_knight/manifest.json                      chunk级清单（视频/帧数/来源URL等）
-   data/hollow_knight/annotations.parquet                合并表（含 video/chunk/frame_idx 溯源列）
+4. 输出（输出目录按 --game 动态命名，避免不同游戏互相覆盖）：
+   data/<game>/raw/<video_id>/<chunk_id>.parquet  每chunk一份原始标注
+   data/<game>/manifest.json                      chunk级清单（视频/帧数/来源URL等）
+   data/<game>/annotations.parquet                合并表（含 video/chunk/frame_idx 溯源列）
 5. 合并表列约定（与官方 BUTTON_ACTION_TOKENS 字母序对齐）：
    17 个按键列（小写）+ j_left/j_right（list[f64]，[-1,1]，(-1,-1)=左上，与模型输出同坐标系）。
 """
@@ -34,11 +35,11 @@ BUTTON_COLS = [
     "left_shoulder", "left_thumb", "left_trigger", "north", "right_shoulder",
     "right_thumb", "right_trigger", "south", "start", "west",
 ]
-TARGET_GAME = "hollow_knight"
+TARGET_GAME = "hades"
 
 # SHARD_0034 在 HuggingFace 缓存中的位置（snapshot 符号链接 -> blobs 实体）
 HF_SNAPSHOT = Path.home() / ".cache" / "huggingface" / "hub" / "datasets--nvidia--NitroGen" / "snapshots"
-OUT_ROOT = Path(__file__).resolve().parent.parent / "data" / "hollow_knight"
+DATA_ROOT = Path(__file__).resolve().parent.parent / "data"
 
 
 def resolve_shard_path(explicit: str | None) -> Path:
@@ -80,10 +81,13 @@ def main():
     ap = argparse.ArgumentParser(description="从 SHARD_0034 提取指定游戏的手柄标注")
     ap.add_argument("--shard", default=None, help="SHARD_0034.tar.gz 路径（默认自动定位 HF 缓存）")
     ap.add_argument("--game", default=TARGET_GAME, help=f"要提取的游戏名（默认 {TARGET_GAME}）")
+    ap.add_argument("--video", default=None, help="只提取指定 video_id（可选，默认全部）")
     ap.add_argument("--limit", type=int, default=None, help="最多提取的 chunk 数（冒烟验证用）")
     args = ap.parse_args()
 
     shard = resolve_shard_path(args.shard)
+    # 输出目录按游戏动态命名，避免不同游戏互相覆盖
+    OUT_ROOT = DATA_ROOT / args.game
     print(f"shard : {shard}")
     print(f"game  : {args.game}")
     print(f"out   : {OUT_ROOT}")
@@ -116,12 +120,14 @@ def main():
             if len(parts) != 4:
                 continue
             _, video, chunk, fname = parts
+            # 视频过滤：指定了 --video 时只处理该视频
+            video_ok = args.video is None or video == args.video
 
             if fname == "metadata.json":
                 meta = json.load(io.TextIOWrapper(tf.extractfile(m), encoding="utf-8"))
                 game = meta.get("game")
                 video_game.setdefault(video, game)
-                if game == args.game:
+                if game == args.game and video_ok:
                     ov = meta["original_video"]
                     chunk_meta[f"{video}|{chunk}"] = {
                         "url": ov.get("url"),
@@ -143,12 +149,12 @@ def main():
                 # metadata 到达 -> 该视频 game 已知，处理 pending 中缓存的 parquet
                 if video in pending:
                     for pchunk, pdata in pending.pop(video).items():
-                        if game == args.game:
+                        if game == args.game and video_ok:
                             save_chunk(video, pchunk, pdata)
                 continue
 
             if fname == "actions_processed.parquet":
-                if video_game.get(video) == args.game:
+                if video_game.get(video) == args.game and video_ok:
                     processed_seen.add(f"{video}|{chunk}")
                 continue
 
@@ -157,7 +163,7 @@ def main():
 
             # actions_raw.parquet 成员
             if video in video_game:  # game 已知（非首个 chunk）
-                if video_game[video] == args.game:
+                if video_game[video] == args.game and video_ok:
                     save_chunk(video, chunk, tf.extractfile(m).read())
             else:  # 首个 chunk 的 parquet 先于 metadata 出现：缓存待定
                 pending.setdefault(video, {})[chunk] = tf.extractfile(m).read()
