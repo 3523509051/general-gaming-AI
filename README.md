@@ -5,8 +5,9 @@
 - 论文：<https://arxiv.org/abs/2601.02427>
 - 官网：<https://nitrogen.minedojo.org/>
 - 官方代码：<https://github.com/MineDojo/NitroGen>
-- 数据集：<https://huggingface.co/datasets/nvidia/NitroGen>（本课题仅下载单个分片，不下全库）
-- 预训练权重：`ng.pt`（CC BY-NC 4.0，仅限非商业研究用途）
+- 模型权重（HF Hub）：<https://huggingface.co/nvidia/NitroGen>（含 `ng.pt` 预训练权重，CC BY-NC 4.0 非商业用途）
+- 数据集（HF Hub）：<https://huggingface.co/datasets/nvidia/NitroGen>（100 个分片，约 165 GB；本课题仅下载 1 个分片）
+- 本课题使用的切片：<https://huggingface.co/datasets/nvidia/NitroGen/blob/main/actions/SHARD_0034.tar.gz>（直接下载地址）
 
 ## 课题范围（MVP 摘要）
 
