@@ -56,9 +56,7 @@ general-gaming-AI/
 
 ## 环境复现步骤
 
-硬件：Windows 11 + NVIDIA RTX 5060（8GB，Blackwell）。以下步骤已在 2026-08-19 实测通过。
-
-> **平台适用性**：验证环境为 Windows + NVIDIA GPU。官方推理代码硬编码 CUDA（`model.to("cuda")`），macOS 与无 NVIDIA 显卡的机器无法直接复现；Linux + NVIDIA GPU 理论可行但未实测。RTX 50 系需 cu128 版 PyTorch。
+验证环境：Windows 11 + NVIDIA RTX 5060（8GB，Blackwell）。以下步骤已在 2026-08-19 实测通过。
 
 ### 1. 克隆本仓库与官方代码
 
@@ -68,15 +66,42 @@ cd general-gaming-AI
 git clone https://github.com/MineDojo/NitroGen.git
 ```
 
-### 2. 创建虚拟环境并安装依赖
+### 2. 创建虚拟环境
 
 ```powershell
 python -m venv NitroGen\.venv
 NitroGen\.venv\Scripts\python.exe -m pip install --upgrade pip
-NitroGen\.venv\Scripts\python.exe -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-NitroGen\.venv\Scripts\python.exe -m pip install -e ".[serve]"
-# 前后端平台与分析脚本依赖（2026-08-22 实测通过）
-NitroGen\.venv\Scripts\python.exe -m pip install flask polars pandas matplotlib pyarrow
+```
+
+### 3. 安装 PyTorch（显卡自适应）
+
+官方 NitroGen 推理硬编码 CUDA（`model.to("cuda")`），**必须有 NVIDIA GPU**。不同显卡架构对应不同 PyTorch + CUDA 索引版本，用自适应脚本自动匹配：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_torch.ps1          # 先检测，提示推荐命令
+powershell -ExecutionPolicy Bypass -File scripts\install_torch.ps1 -ShowTable # 查看兼容表
+powershell -ExecutionPolicy Bypass -File scripts\install_torch.ps1 -Install   # 确认后自动安装
+```
+
+**PyTorch + CUDA 索引兼容表**（脚本内置，也可手动装）：
+
+| 显卡系列 | 架构 | CUDA 索引 | 说明 |
+| --- | --- | --- | --- |
+| RTX 50 系 | Blackwell (sm_120) | `cu128` | 必须 cu128（torch≥2.7） |
+| RTX 40 系 | Ada Lovelace (sm_89) | `cu126` | 推荐 cu126 |
+| RTX 30 系 | Ampere (sm_86) | `cu121` | 推荐 cu121 |
+| RTX 20 / GTX 16 系 | Turing (sm_75) | `cu118` | 推荐 cu118 |
+| GTX 10 系及更早 | Pascal (sm_61) | `cu118` | cu118 或更老 |
+
+手动安装示例（以 RTX 40 系为例）：`pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126`。
+
+> **无 NVIDIA GPU 的机器**（macOS / AMD / 纯 CPU）：无法复现官方推理（`model.to("cuda")` 硬编码），`install_torch.ps1` 会明确报错；这不是换 CPU 版 PyTorch 能解决的，请使用带 NVIDIA GPU 的环境。
+
+### 4. 安装其余依赖
+
+```powershell
+NitroGen\.venv\Scripts\python.exe -m pip install -e ".[serve]"          # 官方 nitrogen 运行时
+NitroGen\.venv\Scripts\python.exe -m pip install -r requirements.txt    # 顶层依赖清单（分析 + Web）
 ```
 
 > **重要**：官方代码不锁定 transformers 版本，必须锁定 **transformers == 4.57.1**（5.x 有 `SiglipVisionModel.vision_model` 破坏性变更，会导致加载 ng.pt 报 `AttributeError`）：
@@ -87,7 +112,7 @@ NitroGen\.venv\Scripts\python.exe -m pip install flask polars pandas matplotlib 
 
 > 国内网络若 `pip install` 慢，可在命令后加 `-i https://pypi.tuna.tsinghua.edu.cn/simple`（清华镜像）。
 
-### 3. 下载预训练权重
+### 5. 下载预训练权重
 
 ```powershell
 NitroGen\.venv\Scripts\python.exe -c "from huggingface_hub import hf_hub_download; hf_hub_download('nvidia/NitroGen','ng.pt',local_dir=r'NitroGen')"
@@ -95,7 +120,7 @@ NitroGen\.venv\Scripts\python.exe -c "from huggingface_hub import hf_hub_downloa
 
 首次推理会自动下载 SigLIP2-large 视觉编码器（约 3.4 GB，缓存在 `%USERPROFILE%\.cache\huggingface\hub`）。
 
-### 4. 下载数据分片（可选，评估新游戏用）
+### 6. 下载数据分片（可选，评估新游戏用）
 
 课程约束：不得下载数据集全库（约 165 GB），本课题只下载 1 个分片：
 
@@ -200,7 +225,7 @@ NitroGen\.venv\Scripts\python.exe scripts\plot_shift_scan.py --game <game> --vid
 | 包 | 版本 | 备注 |
 | --- | --- | --- |
 | Python | 3.10.11 | |
-| torch | 2.11.0+cu128 | RTX 5060 需要 cu128 |
+| torch | 按显卡自适应（见第 3 步兼容表） | 本机实测 2.11.0+cu128（RTX 50 系） |
 | transformers | **4.57.1** | 必须锁 4.x，5.x 不兼容 |
 | diffusers | 0.39.0 | |
 | numpy | 2.2.6 | |
