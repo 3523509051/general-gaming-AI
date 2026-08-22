@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NitroGen 零样本评估工作台</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/js/echarts.min.js"></script>
+</head>
+<body>
+
+<!-- 顶部栏 -->
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◆</span>
+    <div>
+      <h1>NitroGen 零样本评估工作台</h1>
+      <p class="sub">视觉-动作基础模型 · 单帧交互识别（约 0.3s/帧，非实时）</p>
+    </div>
+  </div>
+  <div class="selectors">
+    <label>游戏
+      <select id="gameSelect" onchange="onGameChange(this.value)">
+        <option value="">加载中...</option>
+      </select>
+    </label>
+    <label>视频
+      <select id="videoSelect" onchange="onVideoChange(this.value)" disabled>
+        <option value="">请先选择游戏</option>
+      </select>
+    </label>
+    <button id="videoDownloadBtn" class="ghost-btn" onclick="triggerDownload()" title="下载选中的视频到 data/videos/">⬇ 下载视频</button>
+    <button id="rescanBtn" class="ghost-btn" onclick="triggerRescan()" title="重新探测视频链接可用性">探测链接 ↻</button>
+  </div>
+</header>
+
+<!-- 血缘状态条 -->
+<div class="lineage-bar" id="lineageBar">
+  <span class="lineage-label">当前选择</span>
+  <span id="lineageText" class="lineage-text">未选择</span>
+  <span id="lineageBadge" class="badge">—</span>
+  <span class="lineage-hint">血缘校验：选中后所有请求锁定 (game, video) 组合，杜绝数据错配</span>
+</div>
+
+<!-- 读取本地分片横幅（选择未提取游戏时出现；仅提取标注，不联网） -->
+<div id="extractBanner" class="extract-banner hidden">
+  <div class="extract-head">
+    <span id="extractIcon" class="extract-icon">📦</span>
+    <span id="extractInfo" class="extract-info"></span>
+    <button id="extractBtn" class="primary-btn" onclick="triggerExtract()">读取本地分片</button>
+  </div>
+  <div class="extract-note">说明：读取本地 SHARD 分片并提取标注（纯本地、不联网）；视频链接探测是独立操作，用顶栏「探测链接」。</div>
+  <pre id="extractLog" class="extract-log hidden"></pre>
+</div>
+
+<!-- 视频探测进度横幅 -->
+<div id="rescanBanner" class="rescan-banner hidden">
+  <span id="rescanText" class="rescan-text"></span>
+  <button id="rescanCancelBtn" class="mini-btn" onclick="cancelRescan()" style="display:none">停止</button>
+  <div class="progress-track"><div id="rescanBar" class="progress-bar" style="width:0%"></div></div>
+</div>
+
+<!-- 评估运行进度横幅 -->
+<div id="evalBanner" class="eval-banner hidden">
+  <span id="evalText" class="rescan-text">评估运行中…</span>
+  <pre id="evalLog" class="extract-log hidden"></pre>
+</div>
+
+<!-- 视频下载进度横幅（仅下载中/完成/失败时出现） -->
+<div id="downloadBanner" class="download-banner hidden">
+  <div class="download-head">
+    <span id="downloadIcon">⬇️</span>
+    <span id="downloadText" class="rescan-text">正在下载视频…</span>
+    <button id="downloadCancelBtn" class="mini-btn" onclick="cancelDownload()" style="display:none">停止下载</button>
+  </div>
+  <div class="progress-track"><div id="downloadBar" class="progress-bar" style="width:0%"></div></div>
+</div>
+
+<!-- 主内容 -->
+<main>
+  <!-- Tab 栏 -->
+  <nav class="tabs">
+    <button class="tab active" data-tab="tab-recog" onclick="switchTab('tab-recog')">① 模型识别</button>
+    <button class="tab" data-tab="tab-stats" onclick="switchTab('tab-stats')">② 统计分布</button>
+    <button class="tab" data-tab="tab-seq" onclick="switchTab('tab-seq')">③ 序列对比</button>
+  </nav>
+
+  <!-- Tab 1: 模型识别 -->
+  <section id="tab-recog" class="tab-panel active">
+    <div class="recog-layout">
+      <!-- 左：帧选择 + 画面 -->
+      <div class="recog-left card">
+        <h3>帧选择</h3>
+        <div class="frame-nav">
+          <button class="ghost-btn" onclick="stepFrame(-1)">◀ 上一帧</button>
+          <div class="frame-input-wrap">
+            <input type="number" id="frameInput" class="frame-input"
+                   onchange="onFrameInput(this.value)" placeholder="帧号">
+            <span id="frameSecond" class="frame-second"></span>
+          </div>
+          <button class="ghost-btn" onclick="stepFrame(1)">下一帧 ▶</button>
+        </div>
+        <input type="range" id="frameSlider" class="frame-slider" min="0" max="0" value="0"
+               oninput="onFrameSlider(this.value)">
+        <div class="frame-preview-wrap">
+          <img id="framePreview" class="frame-preview" src="" alt="帧画面"
+               onerror="this.src=''; this.classList.add('empty')">
+          <div id="inferenceOverlay" class="inference-overlay hidden">推理中…</div>
+        </div>
+        <div id="gtSummary" class="gt-summary"></div>
+      </div>
+
+      <!-- 右：识别结果 -->
+      <div class="recog-right">
+        <div class="card">
+          <div class="card-head">
+            <h3>手柄识别结果（17 键 + 双摇杆）</h3>
+            <div class="legend">
+              <span class="lg lg-hit">命中</span>
+              <span class="lg lg-miss">漏报(真值按)</span>
+              <span class="lg lg-false">误报(预测按)</span>
+              <span class="lg lg-off">未按</span>
+            </div>
+          </div>
+          <div id="gamepad" class="gamepad-svg-wrap">
+            <svg viewBox="0 0 720 360" class="gamepad-svg" aria-label="手柄可视化">
+              <!-- 17 键 + 2 摇杆 + 2 摇杆按键 + 肩键/扳机 都由 JS 动态填充 -->
+            </svg>
+          </div>
+          <div id="gamepadList" class="gamepad-list"></div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <h3>摇杆轨迹（18 步动作块）</h3>
+            <label class="shift-label">对齐 shift
+              <select id="shiftSelect" onchange="onShiftChange(this.value)">
+                <option value="auto">auto</option>
+              </select>
+            </label>
+          </div>
+          <div id="stickChart" class="stick-chart"></div>
+        </div>
+        <div class="metrics-row" id="frameMetrics"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Tab 2: 统计分布 -->
+  <section id="tab-stats" class="tab-panel">
+    <div class="stats-layout">
+      <div class="card"><h3>按键触发率（全量标注帧）</h3><div id="buttonChart" class="chart-lg"></div></div>
+      <div class="card">
+        <h3>摇杆位置分布（左 / 右）</h3>
+        <div class="stick-dist-row">
+          <div><div class="stick-dist-title">左摇杆</div><div id="stickDistLeftChart" class="chart-md"></div></div>
+          <div><div class="stick-dist-title">右摇杆</div><div id="stickDistRightChart" class="chart-md"></div></div>
+        </div>
+      </div>
+      <div class="stats-side">
+        <div class="card" id="statsSummaryCard"><h3>统计摘要</h3><div id="statsSummary"></div></div>
+        <div class="card">
+          <h3>静态图（matplotlib 产物）</h3>
+          <div id="staticPlots" class="static-plots"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Tab 3: 序列对比 -->
+  <section id="tab-seq" class="tab-panel">
+    <div class="card diff-definition" id="diffDefinitionCard">
+      <h3>差异定义（扩展 C）</h3>
+      <div id="diffDefinition" class="diff-definition-body"></div>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <h3>约 20 段手柄动作差异曲线</h3>
+        <div class="seq-controls">
+          <label>曲线
+            <select id="seqMetric" onchange="renderSeqChart()">
+              <option value="press">按键数 (n_press)</option>
+              <option value="jlx">左摇杆 x</option>
+              <option value="jly">左摇杆 y</option>
+              <option value="jrx">右摇杆 x</option>
+              <option value="jry">右摇杆 y</option>
+              <option value="diff">综合差异分 D</option>
+            </select>
+          </label>
+        </div>
+      </div>
+      <div id="segmentsChart" class="chart-lg"></div>
+      <div id="seqChart" class="chart-xl"></div>
+    </div>
+    <div class="card">
+      <h3>差异最大 Top-5 帧（点击查看该帧详情）</h3>
+      <table class="top5-table" id="top5Table">
+        <thead><tr>
+          <th>帧号</th><th>时间</th><th>差异键数</th>
+          <th>摇杆L2(左/右)</th><th>综合差异分D</th>
+          <th>真值按键数</th><th>预测按键数</th><th>差异明细</th><th>IDLE</th><th></th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<!-- 全局错误横幅 -->
+<div id="errorBanner" class="error-banner hidden"></div>
+
+<footer class="footer">
+  NitroGen zero-shot 评估平台 · 数据血缘 (game, video, absolute_frame) 三方一致 ·
+  标注为官方 SegFormer AI 提取的参考标注（非严格真值）
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
