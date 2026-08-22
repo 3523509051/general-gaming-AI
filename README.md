@@ -121,7 +121,31 @@ NitroGen\.venv\Scripts\python.exe -c "from huggingface_hub import hf_hub_downloa
 
 首次推理会自动下载 SigLIP2-large 视觉编码器（约 3.4 GB，缓存在 `%USERPROFILE%\.cache\huggingface\hub`）。
 
-### 6. 下载数据分片（可选，评估新游戏用）
+### 6. 验证：跑通 ng.pt 推理（冒烟测试）
+
+加载模型后**立即**做一次等价调用，确认安装正确：
+
+```powershell
+NitroGen\.venv\Scripts\python.exe scripts\smoke_test.py
+```
+
+预期输出（实测值，2026-08-19）：
+
+```
+[1/3] loading model from ng.pt ...
+      model loaded in 11.0s
+[2/3] running predict on a dummy 1280x720 frame ...
+      inference done in 1.0s
+[3/3] outputs:
+      buttons shape: (18, 21)
+      j_left  shape: (18, 2)
+      j_right shape: (18, 2)
+SMOKE TEST PASSED
+```
+
+`smoke_test.py` 内部即官方 `InferenceSession` 加载 ng.pt + 单帧推理（等价调用）：输入一帧 RGB 图像，输出 18 步动作块（每步 21 维按键概率 + 左/右摇杆 x、y）。**出现 `SMOKE TEST PASSED` 即安装与加载正确**，可继续下一步。
+
+### 7. 下载数据分片（可选，评估新游戏用）
 
 课程约束：不得下载数据集全库（约 165 GB），按需下载**少量分片**即可。每个分片约 1~2 GB，含若干游戏的手柄标注：
 
@@ -163,40 +187,6 @@ NitroGen\.venv\Scripts\python.exe scripts\app.py   # 监听 http://localhost:500
 - 一键脚本：窗口按回车即关闭（脚本内已停旧进程）；
 - 手动分步启动：`Ctrl+C`；若端口被占：
   `Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -like "*app.py*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`
-
-### 推理冒烟测试（可复现验证：安装并加载 ng.pt）
-
-跑通官方 ng.pt 的等价调用（`scripts/smoke_test.py` 内部即官方 `InferenceSession` 加载权重 + 单帧推理）：
-
-```powershell
-NitroGen\.venv\Scripts\python.exe scripts\smoke_test.py
-```
-
-预期输出（实测值，2026-08-19）：
-
-```
-[1/3] loading model from ng.pt ...
-      model loaded in 11.0s
-[2/3] running predict on a dummy 1280x720 frame ...
-      inference done in 1.0s
-[3/3] outputs:
-      buttons shape: (18, 21)
-      j_left  shape: (18, 2)
-      j_right shape: (18, 2)
-SMOKE TEST PASSED
-```
-
-即：输入一帧 RGB 图像，模型输出 18 步动作块（每步 21 维按键概率 + 左/右摇杆 x、y）。
-
-### 官方推理服务（可选，接 Windows 游戏实时控制用）
-
-```powershell
-NitroGen\.venv\Scripts\python.exe NitroGen\scripts\serve.py NitroGen\ng.pt
-# 另开终端：
-NitroGen\.venv\Scripts\python.exe NitroGen\scripts\play.py --process '<游戏进程名>.exe'
-```
-
-本课题评估离线进行，不依赖此步骤（评估走 `scripts/evaluate.py` 的等价调用）。
 
 ### 数据 / 评估命令行
 
