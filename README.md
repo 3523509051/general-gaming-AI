@@ -15,8 +15,8 @@
 | --- | --- | --- |
 | 1 | 跑通官方 ng.pt 推理，README 可复现 | ✅ 环境就绪，冒烟测试通过 |
 | 2 | 同一游戏标注 ≥ 500 帧：按键/摇杆分布统计 + ≥ 10 条序列可视化 | ✅ Hades（53.8 万帧）/ lies_of_p / star_fox_64 已提取并出图 |
-| 3 | ≥ 200 帧测试集：按键准确率、摇杆 MSE / 相关系数 | ✅ Hades 200 帧 acc17=0.952；lies_of_p 198 帧 acc17=0.959 |
-| 4 | zero-shot 基线对比 | ✅ 已对比（按键达标 0.95+，摇杆相关 ~0 未达 0.4，分析见项目备忘） |
+| 3 | 约 500 帧量级测试集（B 口径）：按键一致率、摇杆 MSE / 相关系数 | ✅ hades 493 帧 acc=0.41；lies_of_p 198 帧 acc=0.42（B 口径，纯随机抽样） |
+| 4 | zero-shot 基线对比 | ✅ 已对比（按键达标 ~0.5，摇杆相关 ~0 未达 0.4，分析见项目备忘） |
 | 5 | 第 5 天演示：模型输出 vs 标注对比 | 🔶 前后端 Web 平台已完成，待演示走查 |
 | 6 | 归档代码与指标表，实验说明写入结课大报告 | 待做 |
 
@@ -27,8 +27,8 @@
 ```
 general-gaming-AI/
 ├── README.md             # 本文件（可复现说明 + 前后端工具用法）
-├── 项目备忘.md            # 技术约定、实验结果、待决问题
-├── 网页可视化平台实施文档.md # Web 平台设计（12 节）
+├── 项目备忘.md            # 技术约定、实验结果、待决问题（仅本地保留，不入库）
+├── 网页可视化平台实施文档.md # Web 平台设计（12 节，仅本地保留，不入库）
 ├── scripts/              # 本课题自有脚本（数据流水线 + 平台后端）
 │   ├── app.py            # Flask 后端（Web 平台，10+ 接口）
 │   ├── scan_shard.py     # 一键识别切片：89 游戏/311 视频/链接清单
@@ -167,7 +167,9 @@ python scripts\scan_shard.py
 NitroGen\.venv\Scripts\python.exe scripts\extract_game.py --game <game>
 
 # zero-shot 评估（自动建测试集 → 模型推理 → shift 扫描 → 写入 eval_results.db）
+# 默认 500 帧纯随机抽样（B 口径）；复用旧测试集时帧数不符会自动重建
 NitroGen\.venv\Scripts\python.exe scripts\evaluate.py --game <game> --video <video> --fps <fps>
+# 可选：--test-size 500（帧数，默认 500） / --sample-mode random|stratified / --seq-mode（连续片段序列集 10x50 帧）
 
 # 统计图 / shift 扫描图（matplotlib，中文）
 NitroGen\.venv\Scripts\python.exe scripts\stats_viz.py --game <game>
@@ -184,7 +186,7 @@ NitroGen\.venv\Scripts\python.exe scripts\plot_shift_scan.py --game <game> --vid
 | --- | --- |
 | ① 模型识别 | 帧滑条选帧 → 模型实时推理（约 0.3s/帧）→ SVG 手柄 17 键可视化 + 双摇杆轨迹（18 步动作块）；绿=命中/蓝=漏报/橙=误报 |
 | ② 统计分布 | 全量标注帧实时计算：按键触发率柱状图、左右摇杆位置分布（同等地位）、统计摘要、matplotlib 静态图（可一键生成） |
-| ③ 序列对比 | 综合差异分 D 曲线 + 约 20 段手柄动作曲线（每段 10 帧）+ 差异最大 Top-5 帧表（含左右摇杆 L2、差异明细，可跳转 Tab① 详情） |
+| ③ 序列对比 | 综合差异分 D 曲线 + 分段手柄动作曲线（每段 10 帧，测试集帧数/10 段）+ 差异最大 Top-5 帧表（含左右摇杆 L2、差异明细，可跳转 Tab① 详情） |
 
 ### 顶栏按钮
 
@@ -209,6 +211,17 @@ NitroGen\.venv\Scripts\python.exe scripts\plot_shift_scan.py --game <game> --vid
 | `HF_HUB_OFFLINE=1` | 跳过 HF Hub 联网检查 | 权重/编码器已缓存时秒级加载（评估脚本已内置） |
 | `HF_ENDPOINT` | HF 镜像 | 网络受限时指向镜像站 |
 | `HTTPS_PROXY` | 视频探测/下载代理 | `probe_videos.py`/`download` 访问 Twitch/YouTube 需要时设置 |
+
+### YouTube 下载（bot 验证规避）
+
+部分 IP 段访问 YouTube 会触发 "Sign in to confirm you're not a bot"，此时下载需要登录态 cookies：
+
+1. 在浏览器（Edge/Chrome）登录 YouTube，安装 **Get cookies.txt LOCALLY** 扩展；
+2. 打开目标视频页 → 点扩展 → **Export**，得到 `cookies.txt`；
+3. 放入 `data/cookies.txt`（不入库，`.gitignore` 已排除）——下载流程检测到即自动加 `--cookies`；
+4. 重新点"⬇ 下载视频"即可。
+
+探测侧（`probe_videos.py`）已内置 **oEmbed 二次确认**：yt-dlp 被 bot 验证拦下时，自动用 YouTube oEmbed 接口（无需登录）确认真实性，避免把有效链接误标为"未知/失效"。
 
 ## 首跑验证（预期输出）
 
