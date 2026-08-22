@@ -6,7 +6,7 @@
 - 官网：<https://nitrogen.minedojo.org/>
 - 官方代码：<https://github.com/MineDojo/NitroGen>
 - 模型权重（HF Hub）：<https://huggingface.co/nvidia/NitroGen>（含 `ng.pt` 预训练权重，CC BY-NC 4.0 非商业用途）
-- 数据集（HF Hub）：<https://huggingface.co/datasets/nvidia/NitroGen>（100 个分片，约 165 GB；本课题仅下载 1 个分片）
+- 数据集（HF Hub）：<https://huggingface.co/datasets/nvidia/NitroGen>（100 个分片，约 165 GB；本课题按需下载少量分片）
 - 本课题使用的切片：<https://huggingface.co/datasets/nvidia/NitroGen/blob/main/actions/SHARD_0034.tar.gz>（直接下载地址）
 
 ## 课题范围（MVP 摘要）
@@ -15,7 +15,7 @@
 | --- | --- | --- |
 | 1 | 跑通官方 ng.pt 推理，README 可复现 | ✅ 环境就绪，冒烟测试通过 |
 | 2 | 同一游戏标注 ≥ 500 帧：按键/摇杆分布统计 + ≥ 10 条序列可视化 | ✅ Hades（53.8 万帧）/ lies_of_p / star_fox_64 已提取并出图 |
-| 3 | 约 500 帧量级测试集（B 口径）：按键一致率、摇杆 MSE / 相关系数 | ✅ hades 493 帧 acc=0.41；lies_of_p 198 帧 acc=0.42（B 口径，纯随机抽样） |
+| 3 | 测试集（默认 200 帧，前端可调 10~5000）：按键一致率、摇杆 MSE / 相关系数 | ✅ hades / lies_of_p 已评估（B 口径，纯随机抽样，指标见指标条） |
 | 4 | zero-shot 基线对比 | ✅ 已对比（按键达标 ~0.5，摇杆相关 ~0 未达 0.4，分析见项目备忘） |
 | 5 | 第 5 天演示：模型输出 vs 标注对比 | 🔶 前后端 Web 平台已完成，待演示走查 |
 | 6 | 归档代码与指标表，实验说明写入结课大报告 | 待做 |
@@ -31,8 +31,8 @@ general-gaming-AI/
 ├── 网页可视化平台实施文档.md # Web 平台设计（12 节，仅本地保留，不入库）
 ├── scripts/              # 本课题自有脚本（数据流水线 + 平台后端）
 │   ├── app.py            # Flask 后端（Web 平台，10+ 接口）
-│   ├── scan_shard.py     # 一键识别切片：89 游戏/311 视频/链接清单
-│   ├── extract_game.py   # 通用标注提取（--game/--video/--limit）
+│   ├── scan_shard.py     # 一键识别切片：游戏/视频/链接清单（--merge 合并多切片）
+│   ├── extract_game.py   # 通用标注提取（--game/--video/--limit/--shard，自动发现全部切片）
 │   ├── evaluate.py       # 通用 zero-shot 评估（建测试集/推理/shift 扫描/写库）
 │   ├── build_hades_testset.py  # Hades 200 帧测试集构建
 │   ├── stats_viz.py      # 统计可视化（按键/摇杆分布/10 条序列，中文）
@@ -48,7 +48,8 @@ general-gaming-AI/
 │   ├── ng.pt             # 预训练权重 1.84 GB（不入库）
 │   └── .venv/            # Python 虚拟环境（不入库）
 └── data/                 # 实验数据（不入库）
-    ├── games_scan.json   # 89 游戏 311 视频清单
+    ├── games_scan.json   # 切片扫描合并清单（Web 下拉用，171 游戏）
+    ├── shards/           # 切片 tar.gz + 各切片独立清单（SHARD_XXXX.games.json）
     ├── videos/           # 已下载游戏视频（mp4）
     ├── hades|lies_of_p|star_fox_64/  # 标注/测试集/评估产物
     └── eval_results.db   # SQLite 结果库
@@ -122,11 +123,24 @@ NitroGen\.venv\Scripts\python.exe -c "from huggingface_hub import hf_hub_downloa
 
 ### 6. 下载数据分片（可选，评估新游戏用）
 
-课程约束：不得下载数据集全库（约 165 GB），本课题只下载 1 个分片：
+课程约束：不得下载数据集全库（约 165 GB），按需下载**少量分片**即可。每个分片约 1~2 GB，含若干游戏的手柄标注：
 
 ```powershell
+# 例：下载 SHARD_0034（本课题已测的 hades / lies_of_p / star_fox_64 所在）
 NitroGen\.venv\Scripts\python.exe -c "from huggingface_hub import hf_hub_download; hf_hub_download('nvidia/NitroGen','actions/SHARD_0034.tar.gz',repo_type='dataset')"
 ```
+
+**导入新切片（多切片支持）**——切片放在项目 **`data/shards/`** 目录（各自独立，不分片合并）：
+
+- **方式 A（Web 端拖拽）**：启动平台 → 顶栏「导入切片 📦」→ 把 `SHARD_*.tar.gz` **直接拖进弹窗**（或点击选择文件）→ 自动识别并复制到 `data/shards/` → 勾选切片「扫描选中切片」→ 生成独立清单 `data/shards/<SHARD>.games.json`，弹窗内**分开显示各切片内容**（游戏/视频数）→ 选游戏点「读取本地分片」。
+- **方式 B（命令行）**：
+  ```powershell
+  # 1) 扫描切片，生成独立清单（默认写到 data/shards/<SHARD>.games.json）
+  python scripts\scan_shard.py --shard data\shards\SHARD_XXXX.tar.gz
+  # 2) 提取目标游戏标注（自动发现 data/shards/ 全部切片，游戏可能跨切片）
+  NitroGen\.venv\Scripts\python.exe scripts\extract_game.py --game <game>
+  ```
+- 已验证：`data/shards/` 中 SHARD_0000（86 游戏）、SHARD_0026（89 游戏）、SHARD_0034（89 游戏）独立清单分开显示；合并清单（games_scan.json，171 游戏）供 Web 下拉用，切片独立清单各存各的。
 
 ## 启动 / 停止
 
@@ -160,16 +174,18 @@ NitroGen\.venv\Scripts\python.exe scripts\smoke_test.py
 ### 数据 / 评估命令行
 
 ```powershell
-# 识别切片（生成 data/games_scan.json，首次或更新时用）
+# 识别切片（生成 data/games_scan.json；默认自动定位 data/shards/ 中的切片）
 python scripts\scan_shard.py
+python scripts\scan_shard.py --shard data\shards\SHARD_XXXX.tar.gz --merge   # 扫描新切片并合并（多切片导入）
 
-# 提取指定游戏标注（hades / lies_of_p / star_fox_64 已提取，新游戏需先下载对应分片）
+# 提取指定游戏标注（自动发现 data/shards/ 全部 SHARD_*.tar.gz，游戏可能跨切片）
+# hades / lies_of_p / star_fox_64 已提取；指定切片用 --shard <路径>
 NitroGen\.venv\Scripts\python.exe scripts\extract_game.py --game <game>
 
 # zero-shot 评估（自动建测试集 → 模型推理 → shift 扫描 → 写入 eval_results.db）
-# 默认 500 帧纯随机抽样（B 口径）；复用旧测试集时帧数不符会自动重建
+# 默认 200 帧纯随机抽样（B 口径）；复用旧测试集时帧数不符会自动重建
 NitroGen\.venv\Scripts\python.exe scripts\evaluate.py --game <game> --video <video> --fps <fps>
-# 可选：--test-size 500（帧数，默认 500） / --sample-mode random|stratified / --seq-mode（连续片段序列集 10x50 帧）
+# 可选：--test-size 200（帧数，默认 200，Web 端指标条可调） / --sample-mode random|stratified / --seq-mode（连续片段序列集）
 
 # 统计图 / shift 扫描图（matplotlib，中文）
 NitroGen\.venv\Scripts\python.exe scripts\stats_viz.py --game <game>
@@ -194,15 +210,18 @@ NitroGen\.venv\Scripts\python.exe scripts\plot_shift_scan.py --game <game> --vid
 | --- | --- |
 | `⬇ 下载视频` | 后台下载当前视频到 `data/videos/`，进度条实时显示 |
 | `探测链接 ↻` | 探测当前游戏视频链接可用性（未选游戏时全量探测，需确认） |
+| `导入切片 📦` | 把 `SHARD_*.tar.gz` 拖进弹窗 → 自动复制到 `data/shards/` → 扫描生成独立清单（多切片导入） |
 | `读取本地分片` | 未提取游戏时出现：读取本地 SHARD 分片并提取标注（纯本地不联网，先确认预计耗时） |
 | `生成静态图` | Tab② 统计图中无图时：后台生成 matplotlib PNG |
 | `运行评估` | Tab③ 无评估产物时：后台跑 evaluate.py（建测试集+推理+shift 扫描+写库），自动刷新序列对比 |
 
+> 游戏下拉框按切片分组显示（optgroup）；指标条带「测试集帧数 + 重新评估」入口（默认 200，可调 10~5000）。
+
 > 后台任务（提取/评估/探测/下载）互斥，同一时间只运行一个；所有任务都有进度横幅 + 可停止。
 
-### 后端接口（GET）
+### 后端接口
 
-`/api/games`（游戏列表含已测标记）、`/api/games/<game>/videos`（视频列表含状态）、`/api/frame`（单帧识别，血缘断言 + shift）、`/api/stats`（统计分布）、`/api/sequences`（序列 + Top-5 + 差异定义）、`/api/testset`（测试集帧列表）、`/api/rescan`（探测）、`/api/evaluate`（评估）、`/api/download`（下载）、`/api/genplots`（静态图）。
+`/api/games`（游戏列表含已测标记、按切片分组）、`/api/games/<game>/videos`（视频列表含状态）、`/api/frame`（单帧识别，血缘断言 + shift）、`/api/stats`（统计分布）、`/api/sequences`（序列 + Top-5 + 差异定义）、`/api/testset`（测试集帧列表）、`/api/metrics`（核心指标对比，支持 `?shift=k` 实时）、`/api/rescan`（探测）、`/api/evaluate`（评估，支持 `test_size` 参数）、`/api/download`（下载）、`/api/genplots`（静态图）、`/api/shaders`（本地切片列表）、`/api/scan_shard`（扫描合并切片）、`/api/upload_shard`（拖拽上传切片）。
 
 ## 必要环境变量
 
@@ -225,7 +244,7 @@ NitroGen\.venv\Scripts\python.exe scripts\plot_shift_scan.py --game <game> --vid
 
 ## 首跑验证（预期输出）
 
-1. 启动 Web 平台 → 浏览器打开 `http://localhost:5000` → 游戏下拉出现 89 个游戏，`hades`/`lies_of_p` 标"已测"。
+1. 启动 Web 平台 → 浏览器打开 `http://localhost:5000` → 游戏下拉按切片分组显示 171 个游戏，`hades`/`lies_of_p` 标"已测"。
 2. 选 `lies_of_p / v2276819038` → Tab① 选帧 4963 → 手柄可视化 + 指标卡（首次推理需模型加载约 10s）。
 3. 命令行验证：
    ```powershell

@@ -299,8 +299,8 @@ def main():
     ap.add_argument("--game", required=True)
     ap.add_argument("--video", default=None)
     ap.add_argument("--fps", type=int, default=None, help="视频帧率（构建测试集时必填）")
-    ap.add_argument("--test-size", type=int, default=500,
-                    help="测试集帧数（论文口径约 500 帧量级；旧 200 帧偏少，用户 2026-08-22 指出）")
+    ap.add_argument("--test-size", type=int, default=200,
+                    help="测试集帧数（默认 200，可在 Web 平台评估引导处调整）")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--rebuild-testset", action="store_true", help="强制重建测试集")
     ap.add_argument("--sample-mode", choices=["random", "stratified"], default="random",
