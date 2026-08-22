@@ -21,6 +21,9 @@ venv/
 .env
 .env.*
 !.env.example
+# 浏览器导出的 YouTube cookies（含登录态，绝不提交）
+data/cookies.txt
+cookies.txt
 
 # --- 5. IDE / 编辑器本地数据 ---
 .idea/

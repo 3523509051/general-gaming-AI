@@ -1211,7 +1211,13 @@ def _run_download(game: str, video: str, url: str):
         py = shutil.which("python") or sys.executable
         cmd = [py, "-m", "yt_dlp"]
     cmd += ["--newline", "--no-warnings", "-f", "bv*[height<=720]+ba/b",
-            "--merge-output-format", "mp4", "-o", str(out), url]
+            "--merge-output-format", "mp4", "-o", str(out)]
+    # YouTube bot 验证（"Sign in to confirm you're not a bot"）规避：
+    # 优先用 data/cookies.txt（浏览器插件导出，见 README）；PO Token 插件(bgutil)已装时自动生效
+    cookies_file = DATA_ROOT / "cookies.txt"
+    if cookies_file.exists():
+        cmd += ["--cookies", str(cookies_file)]
+    cmd += [url]
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="replace")

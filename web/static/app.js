@@ -103,6 +103,8 @@ async function loadGames() {
       sel.appendChild(o);
     }
     sel.disabled = false;
+    // 保留当前选中（重建 option 后 value 会丢，需恢复；兼容 state.game 已设置的情况）
+    if (state.game) sel.value = state.game;
   } catch (e) { showError("加载游戏列表失败: " + e.message); }
 }
 
@@ -115,6 +117,9 @@ async function onGameChange(game, presetVideo) {
   state.loadedTabs = {};
   state.gameInfo = state.games.find(g => g.game === game) || null;
   _estShown = false;
+  // 同步下拉框显示（URL 参数/程序化切换时 gameSelect 不会自动跟随）
+  const gsel = document.getElementById("gameSelect");
+  if (gsel) gsel.value = game;
   document.getElementById("videoSelect").disabled = true;
   document.getElementById("videoSelect").innerHTML = '<option value="">加载中...</option>';
   setLineage(`${game} / （未选视频）`, "warn");
@@ -148,8 +153,11 @@ async function loadVideos(presetVideo) {
       sel.value = presetVideo;
       await onVideoChange(presetVideo);
     } else {
-      const dl = d.videos.find(v => v.status === "downloaded");
-      if (dl) { sel.value = dl.video; await onVideoChange(dl.video); }
+      // 自动选中：已下载优先，其次第一个可下载/状态未知的视频（避免"未选视频"导致按钮不可用）
+      const auto = d.videos.find(v => v.status === "downloaded")
+        || d.videos.find(v => v.status === "available")
+        || d.videos.find(v => v.status !== "dead");
+      if (auto) { sel.value = auto.video; await onVideoChange(auto.video); }
     }
   } catch (e) {
     showError(e.message);

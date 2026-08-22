@@ -24,6 +24,8 @@ import json
 import shutil
 import subprocess
 import sys
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 DATA_ROOT = Path(__file__).resolve().parent.parent / "data"
@@ -51,6 +53,33 @@ def find_ytdlp_cmd() -> list[str] | None:
 
 
 _YTDLP = None  # 惰性初始化
+
+
+def probe_oembed(url: str, timeout: int = 15) -> dict | None:
+    """YouTube oEmbed 探测：无需 cookie/登录，纯 HTTP 确认视频是否真实存在。
+
+    对 yt-dlp 被 bot 验证拦下（"Sign in to confirm you're not a bot"）的链接，
+    用官方 oEmbed 接口二次确认虚实：
+      - 返回 JSON（含 title）→ 视频真实存在 → available
+      - 404 / 空 → 视频可能被删/私有 → 仍 unknown（保守，不误判 dead）
+    仅对 youtube.com 链接生效；其它平台返回 None（不适用）。
+    """
+    if "youtube.com" not in url and "youtu.be" not in url:
+        return None
+    api = "https://www.youtube.com/oembed?url=" + urllib.parse.quote(url, safe="")
+    try:
+        req = urllib.request.Request(api, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status == 200:
+                body = json.loads(resp.read().decode("utf-8", "replace"))
+                return {"status": "available", "duration": None,
+                        "error": f"oEmbed 确认存在（{body.get('title', '')[:60]}）"}
+    except Exception as e:  # noqa: BLE001
+        code = getattr(e, "code", None)
+        if code in (404, 410):
+            return {"status": "unknown", "duration": None,
+                    "error": f"oEmbed 404/410（视频可能已删/私有）: {str(e)[:100]}"}
+    return None
 
 
 def probe_one(video: str, url: str) -> dict:
@@ -103,7 +132,10 @@ def probe_one(video: str, url: str) -> dict:
                     "error": f"网络异常（可能未挂梯子，无法判定）: {err_msg}"}
         if any(m in err_lower for m in gone_markers):
             return {"status": "dead", "duration": None, "error": err_msg}
-        # 其它未知错误：保守标 unknown 而非 dead
+        # 其它未知错误（如 bot 验证）：先用 oEmbed 二次确认虚实，再决定标 available 还是 unknown
+        oem = probe_oembed(url)
+        if oem:
+            return oem
         return {"status": "unknown", "duration": None,
                 "error": f"探测异常（无法判定）: {err_msg}"}
     except Exception as e:  # noqa: BLE001
