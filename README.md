@@ -1,6 +1,6 @@
 # 通用游戏智能体（课题七 · 腾讯 IEG 课题）
 
-基于 NVIDIA **NitroGen** 开源视觉-动作基础模型（500M 参数 DiT，flow-matching 行为克隆，训练于 4 万小时 / 1000+ 游戏的手柄标注数据）的 zero-shot 推理、单游戏数据统计与定量评估实践。
+基于 NVIDIA **NitroGen** 开源视觉-动作基础模型（500M 参数 DiT，flow-matching 行为克隆，训练于 4 万小时 / 1000+ 游戏的手柄标注）的 zero-shot 推理、单游戏数据统计与定量评估实践。
 
 - 论文：<https://arxiv.org/abs/2601.02427>
 - 官网：<https://nitrogen.minedojo.org/>
@@ -13,35 +13,51 @@
 | # | 必做内容 | 状态 |
 | --- | --- | --- |
 | 1 | 跑通官方 ng.pt 推理，README 可复现 | ✅ 环境就绪，冒烟测试通过 |
-| 2 | 单游戏（Hollow Knight）≥ 500 帧标注：按键/摇杆分布统计 + ≥ 10 条序列可视化 | 🔶 标注已提取（1,444,200 帧），统计出图进行中 |
-| 3 | ≥ 200 帧测试集：按键准确率、摇杆 MSE / 相关系数 | 待做（指标口径已定，见第 2 天报告） |
-| 4 | zero-shot 基线：按键准确率 ≥ 50%，摇杆相关系数 ≥ 0.4 | 待做 |
-| 5 | 第 5 天演示：模型输出 vs 标注对比 | 待做 |
+| 2 | 同一游戏标注 ≥ 500 帧：按键/摇杆分布统计 + ≥ 10 条序列可视化 | ✅ Hades（53.8 万帧）/ lies_of_p / star_fox_64 已提取并出图 |
+| 3 | ≥ 200 帧测试集：按键准确率、摇杆 MSE / 相关系数 | ✅ Hades 200 帧 acc17=0.952；lies_of_p 198 帧 acc17=0.959 |
+| 4 | zero-shot 基线对比 | ✅ 已对比（按键达标 0.95+，摇杆相关 ~0 未达 0.4，分析见项目备忘） |
+| 5 | 第 5 天演示：模型输出 vs 标注对比 | 🔶 前后端 Web 平台已完成，待演示走查 |
 | 6 | 归档代码与指标表，实验说明写入结课大报告 | 待做 |
 
-扩展方向：**可视化工具**（批量导出 ≥ 20 段动作曲线，标出差异最大的 5 帧）。
-完整范围、进度计划与验收标准见 [`立项书.md`](./立项书.md)。
+扩展方向：**可视化工具**——前后端 Web 平台，批量导出 ≥ 20 段动作曲线，标出差异最大的 5 帧（差异定义见项目备忘）。完整范围见 `立项书.md`（仅本地保留）。
 
 ## 目录结构
 
 ```
 general-gaming-AI/
-├── README.md            # 本文件（可复现说明）
-├── 立项书.md             # 第 1 天立项书
-├── scripts/             # 本课题自有脚本
-│   ├── smoke_test.py    # ng.pt 端到端推理冒烟测试
-│   └── extract_hollow_knight.py  # 从 SHARD_0034 提取 Hollow Knight 标注
-├── NitroGen/            # 官方代码仓库克隆（不入库，见 .gitignore）
-│   ├── ng.pt            # 预训练权重 1.84 GB（不入库）
-│   └── .venv/           # Python 虚拟环境（不入库）
-└── data/                # 提取后的标注数据（不入库）
+├── README.md             # 本文件（可复现说明 + 前后端工具用法）
+├── 项目备忘.md            # 技术约定、实验结果、待决问题
+├── 网页可视化平台实施文档.md # Web 平台设计（12 节）
+├── scripts/              # 本课题自有脚本（数据流水线 + 平台后端）
+│   ├── app.py            # Flask 后端（Web 平台，10+ 接口）
+│   ├── scan_shard.py     # 一键识别切片：89 游戏/311 视频/链接清单
+│   ├── extract_game.py   # 通用标注提取（--game/--video/--limit）
+│   ├── evaluate.py       # 通用 zero-shot 评估（建测试集/推理/shift 扫描/写库）
+│   ├── build_hades_testset.py  # Hades 200 帧测试集构建
+│   ├── stats_viz.py      # 统计可视化（按键/摇杆分布/10 条序列，中文）
+│   ├── plot_shift_scan.py      # shift 扫描曲线（中文，含双摇杆）
+│   ├── init_db.py        # 建 eval_results.db 结果库 + 种子数据
+│   ├── probe_videos.py   # 视频链接可用性探测（yt-dlp）
+│   ├── smoke_test.py     # ng.pt 端到端推理冒烟测试
+│   └── start_web.ps1 / start_web.bat  # Web 平台一键启动
+├── web/                  # 前端（原生 HTML/JS + ECharts，无构建）
+│   ├── index.html        # 三 Tab 工作台入口
+│   └── static/           # app.js / style.css / js/echarts.min.js
+├── NitroGen/             # 官方代码仓库克隆（不入库，见 .gitignore）
+│   ├── ng.pt             # 预训练权重 1.84 GB（不入库）
+│   └── .venv/            # Python 虚拟环境（不入库）
+└── data/                 # 实验数据（不入库）
+    ├── games_scan.json   # 89 游戏 311 视频清单
+    ├── videos/           # 已下载游戏视频（mp4）
+    ├── hades|lies_of_p|star_fox_64/  # 标注/测试集/评估产物
+    └── eval_results.db   # SQLite 结果库
 ```
 
 ## 环境复现步骤
 
 硬件：Windows 11 + NVIDIA RTX 5060（8GB，Blackwell）。以下步骤已在 2026-08-19 实测通过。
 
-> **平台适用性**：本课题验证环境为 Windows + NVIDIA GPU。官方推理代码硬编码 CUDA（`model.to("cuda")`），macOS 与无 NVIDIA 显卡的机器无法直接复现；Linux + NVIDIA GPU 理论上可行但未实测。RTX 50 系需 cu128 版 PyTorch，较老显卡可能需换 cu126 轮子。
+> **平台适用性**：验证环境为 Windows + NVIDIA GPU。官方推理代码硬编码 CUDA（`model.to("cuda")`），macOS 与无 NVIDIA 显卡的机器无法直接复现；Linux + NVIDIA GPU 理论可行但未实测。RTX 50 系需 cu128 版 PyTorch。
 
 ### 1. 克隆本仓库与官方代码
 
@@ -53,20 +69,22 @@ git clone https://github.com/MineDojo/NitroGen.git
 
 ### 2. 创建虚拟环境并安装依赖
 
-RTX 50 系列（Blackwell，sm_120）需要 PyTorch ≥ 2.7 + CUDA 12.8：
-
 ```powershell
 python -m venv NitroGen\.venv
 NitroGen\.venv\Scripts\python.exe -m pip install --upgrade pip
 NitroGen\.venv\Scripts\python.exe -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 NitroGen\.venv\Scripts\python.exe -m pip install -e ".[serve]"
+# 前后端平台与分析脚本依赖（2026-08-22 实测通过）
+NitroGen\.venv\Scripts\python.exe -m pip install flask polars pandas matplotlib pyarrow
 ```
 
-> **重要**：官方代码不锁定 transformers 版本，transformers 5.x 存在 `SiglipVisionModel.vision_model` 破坏性变更，会导致加载 ng.pt 报 `AttributeError`。必须锁定 **transformers == 4.57.1**（若安装时被解析到 5.x，需手动降级）：
+> **重要**：官方代码不锁定 transformers 版本，必须锁定 **transformers == 4.57.1**（5.x 有 `SiglipVisionModel.vision_model` 破坏性变更，会导致加载 ng.pt 报 `AttributeError`）：
 >
 > ```powershell
 > NitroGen\.venv\Scripts\python.exe -m pip install "transformers==4.57.1" -i https://pypi.org/simple
 > ```
+
+> 国内网络若 `pip install` 慢，可在命令后加 `-i https://pypi.tuna.tsinghua.edu.cn/simple`（清华镜像）。
 
 ### 3. 下载预训练权重
 
@@ -74,69 +92,107 @@ NitroGen\.venv\Scripts\python.exe -m pip install -e ".[serve]"
 NitroGen\.venv\Scripts\python.exe -c "from huggingface_hub import hf_hub_download; hf_hub_download('nvidia/NitroGen','ng.pt',local_dir=r'NitroGen')"
 ```
 
-首次推理时会自动从 HF Hub 下载 SigLIP2-large 视觉编码器（约 3.4 GB，缓存在 `%USERPROFILE%\.cache\huggingface\hub`）。
+首次推理会自动下载 SigLIP2-large 视觉编码器（约 3.4 GB，缓存在 `%USERPROFILE%\.cache\huggingface\hub`）。
 
-### 4. 运行推理冒烟测试（可复现验证）
+### 4. 下载数据分片（可选，评估新游戏用）
 
-```powershell
-NitroGen\.venv\Scripts\python.exe scripts\smoke_test.py
-```
-
-预期输出（实测值）：
-
-```
-[1/3] loading model from ng.pt ...
-      model loaded in 11.0s
-[2/3] running predict on a dummy 1280x720 frame ...
-      inference done in 1.0s
-[3/3] outputs:
-      buttons shape: (18, 21)
-      j_left  shape: (18, 2)
-      j_right shape: (18, 2)
-SMOKE TEST PASSED
-```
-
-即：输入一帧 RGB 图像，模型输出 18 步动作块（每步 21 维按键概率 + 左/右摇杆 x、y）。
-
-**为什么看到 `SMOKE TEST PASSED` 就代表测试通过**：这句是脚本的最后一行，只有前面所有步骤成功、所有断言通过才会执行到它（脚本是"负向验证"——默认会失败，任一环节失败都会在中间抛异常或 `AssertionError` 而中断）。能打印出这句话，意味着以下四件事同时成立：
-
-| 关卡 | 脚本位置 | 验证内容 | 失败表现 |
-| --- | --- | --- | --- |
-| 模型加载 | `[1/3]` `from_ckpt` | 权重、模型结构、依赖环境正常 | `AttributeError` / `FileNotFoundError` 等直接崩溃 |
-| 推理执行 | `[2/3]` `predict` | GPU 可用、显存够、flow-matching 16 步积分正常 | OOM 或运行时错误 |
-| 输出形状 | `[3/3]` 前 3 个 `assert` | `buttons` 为 (18,21)、`j_left`/`j_right` 为 (18,2) | `AssertionError: unexpected ... shape` |
-| 数值范围 | 后 2 个 `assert` | 摇杆取值落在 [-1,1] | `AssertionError: ... out of [-1,1] range` |
-
-**边界**：冒烟测试只验证"能跑通、输出形状对、数值合法"，不验证预测动作的准确率或摇杆相关系数（质量指标由第 5 天的评估脚本负责）。
-
-### 5. 官方推理服务（可选，接 Windows 游戏实时控制用）
-
-```powershell
-NitroGen\.venv\Scripts\python.exe NitroGen\scripts\serve.py NitroGen\ng.pt
-# 另开终端：
-NitroGen\.venv\Scripts\python.exe NitroGen\scripts\play.py --process '<游戏进程名>.exe'
-```
-
-本课题评估离线进行，不依赖此步骤。
-
-## 数据获取（仅单分片，不下全库）
-
-课程约束：**不得下载数据集全库**（100 个分片共约 165 GB）。本课题只下载 1 个分片：
+课程约束：不得下载数据集全库（约 165 GB），本课题只下载 1 个分片：
 
 ```powershell
 NitroGen\.venv\Scripts\python.exe -c "from huggingface_hub import hf_hub_download; hf_hub_download('nvidia/NitroGen','actions/SHARD_0034.tar.gz',repo_type='dataset')"
 ```
 
-从分片中提取 Hollow Knight 标注（自动定位 HF 缓存，流式单遍扫描约 3 分钟）：
+## 启动 / 停止
+
+### Web 可视化平台（主演示入口）
+
+**一键启动**（自动停旧实例 → 启动后端 → 打开浏览器）：
 
 ```powershell
-NitroGen\.venv\Scripts\python.exe scripts\extract_hollow_knight.py            # 全量提取
-NitroGen\.venv\Scripts\python.exe scripts\extract_hollow_knight.py --limit 2  # 冒烟验证
+powershell -ExecutionPolicy Bypass -File scripts\start_web.ps1
 ```
 
-产出 `data/hollow_knight/`：`annotations.parquet`（1,444,200 帧 × 17 键 + 左/右摇杆 + 溯源列）、`manifest.json`（chunk 级清单）、`raw/`（1439 个 chunk 原始 parquet）。
+**分步启动**（同效）：
 
-选定游戏统计（全量实测，2026-08-20）：Hollow Knight 共 **1,444,200 帧 / 1439 chunks / 6 个视频**；完全 IDLE 帧占比 37.2%，左摇杆移动率 19.2%，任一按键触发率 45.3%；按压最多为 dpad_left / dpad_right / south（跳跃）/ right_trigger；`guide` 键全量恒 0。
+```powershell
+NitroGen\.venv\Scripts\python.exe scripts\app.py   # 监听 http://localhost:5000
+```
+
+**停止**：
+
+- 一键脚本：窗口按回车即关闭（脚本内已停旧进程）；
+- 手动分步启动：`Ctrl+C`；若端口被占：
+  `Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -like "*app.py*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`
+
+### 推理冒烟测试
+
+```powershell
+NitroGen\.venv\Scripts\python.exe scripts\smoke_test.py
+# 预期最后一行：SMOKE TEST PASSED
+```
+
+### 数据 / 评估命令行
+
+```powershell
+# 识别切片（生成 data/games_scan.json，首次或更新时用）
+python scripts\scan_shard.py
+
+# 提取指定游戏标注（hades / lies_of_p / star_fox_64 已提取，新游戏需先下载对应分片）
+NitroGen\.venv\Scripts\python.exe scripts\extract_game.py --game <game>
+
+# zero-shot 评估（自动建测试集 → 模型推理 → shift 扫描 → 写入 eval_results.db）
+NitroGen\.venv\Scripts\python.exe scripts\evaluate.py --game <game> --video <video> --fps <fps>
+
+# 统计图 / shift 扫描图（matplotlib，中文）
+NitroGen\.venv\Scripts\python.exe scripts\stats_viz.py --game <game>
+NitroGen\.venv\Scripts\python.exe scripts\plot_shift_scan.py --game <game> --video <video>
+```
+
+## 前后端工具：Web 可视化平台（扩展 C）
+
+启动后浏览器打开 `http://localhost:5000`，顶部选择"游戏 + 视频"，即锁定数据血缘 `(game, video, absolute_frame)`（杜绝拿 B 视频比对 A 数据）。
+
+### 三个 Tab
+
+| Tab | 功能 |
+| --- | --- |
+| ① 模型识别 | 帧滑条选帧 → 模型实时推理（约 0.3s/帧）→ SVG 手柄 17 键可视化 + 双摇杆轨迹（18 步动作块）；绿=命中/蓝=漏报/橙=误报 |
+| ② 统计分布 | 全量标注帧实时计算：按键触发率柱状图、左右摇杆位置分布（同等地位）、统计摘要、matplotlib 静态图（可一键生成） |
+| ③ 序列对比 | 综合差异分 D 曲线 + 约 20 段手柄动作曲线（每段 10 帧）+ 差异最大 Top-5 帧表（含左右摇杆 L2、差异明细，可跳转 Tab① 详情） |
+
+### 顶栏按钮
+
+| 按钮 | 作用 |
+| --- | --- |
+| `⬇ 下载视频` | 后台下载当前视频到 `data/videos/`，进度条实时显示 |
+| `探测链接 ↻` | 探测当前游戏视频链接可用性（未选游戏时全量探测，需确认） |
+| `读取本地分片` | 未提取游戏时出现：读取本地 SHARD 分片并提取标注（纯本地不联网，先确认预计耗时） |
+| `生成静态图` | Tab② 统计图中无图时：后台生成 matplotlib PNG |
+| `运行评估` | Tab③ 无评估产物时：后台跑 evaluate.py（建测试集+推理+shift 扫描+写库），自动刷新序列对比 |
+
+> 后台任务（提取/评估/探测/下载）互斥，同一时间只运行一个；所有任务都有进度横幅 + 可停止。
+
+### 后端接口（GET）
+
+`/api/games`（游戏列表含已测标记）、`/api/games/<game>/videos`（视频列表含状态）、`/api/frame`（单帧识别，血缘断言 + shift）、`/api/stats`（统计分布）、`/api/sequences`（序列 + Top-5 + 差异定义）、`/api/testset`（测试集帧列表）、`/api/rescan`（探测）、`/api/evaluate`（评估）、`/api/download`（下载）、`/api/genplots`（静态图）。
+
+## 必要环境变量
+
+| 变量 | 作用 | 说明 |
+| --- | --- | --- |
+| `HF_HUB_OFFLINE=1` | 跳过 HF Hub 联网检查 | 权重/编码器已缓存时秒级加载（评估脚本已内置） |
+| `HF_ENDPOINT` | HF 镜像 | 网络受限时指向镜像站 |
+| `HTTPS_PROXY` | 视频探测/下载代理 | `probe_videos.py`/`download` 访问 Twitch/YouTube 需要时设置 |
+
+## 首跑验证（预期输出）
+
+1. 启动 Web 平台 → 浏览器打开 `http://localhost:5000` → 游戏下拉出现 89 个游戏，`hades`/`lies_of_p` 标"已测"。
+2. 选 `lies_of_p / v2276819038` → Tab① 选帧 4963 → 手柄可视化 + 指标卡（首次推理需模型加载约 10s）。
+3. 命令行验证：
+   ```powershell
+   curl http://localhost:5000/api/games   # -> {"ok": true, "data": {...}}
+   ```
+4. `stats_viz.py --game hades` 应在 `data/hades/stats/` 生成中文 PNG。
 
 ## 关键依赖版本
 
@@ -147,6 +203,8 @@ NitroGen\.venv\Scripts\python.exe scripts\extract_hollow_knight.py --limit 2  # 
 | transformers | **4.57.1** | 必须锁 4.x，5.x 不兼容 |
 | diffusers | 0.39.0 | |
 | numpy | 2.2.6 | |
+| flask | 3.x | Web 平台后端 |
+| polars / pandas / matplotlib / pyarrow | 最新 | 统计与评估 |
 
 ## 许可说明
 
