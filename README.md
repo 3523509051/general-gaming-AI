@@ -39,8 +39,10 @@ general-gaming-AI/
 │   ├── plot_shift_scan.py      # shift 扫描曲线（中文，含双摇杆）
 │   ├── init_db.py        # 建 eval_results.db 结果库 + 种子数据
 │   ├── probe_videos.py   # 视频链接可用性探测（yt-dlp）
+│   ├── install_torch.ps1 # PyTorch 显卡自适应安装（检测显卡→匹配 CUDA 索引→安装）
 │   ├── smoke_test.py     # ng.pt 端到端推理冒烟测试
-│   └── start_web.ps1 / start_web.bat  # Web 平台一键启动
+│   ├── start_web.ps1     # Web 平台一键启动（停旧实例→起 Flask→等端口→开浏览器）
+│   └── start_web.bat     # start_web.ps1 的壳（双击可用，报错不闪退，推荐）
 ├── web/                  # 前端（原生 HTML/JS + ECharts，无构建）
 │   ├── index.html        # 三 Tab 工作台入口
 │   └── static/           # app.js / style.css / js/echarts.min.js
@@ -75,6 +77,8 @@ NitroGen\.venv\Scripts\python.exe -m pip install --upgrade pip
 ```
 
 ### 3. 安装 PyTorch（显卡自适应）
+
+`scripts/install_torch.ps1`：**PyTorch 显卡自适应安装脚本**。原理：调用 `nvidia-smi` 检测本机显卡型号 → 匹配兼容表 → 输出/执行对应 CUDA 索引的 `pip install` 命令（不写死架构，任何 NVIDIA 显卡都能装）。
 
 官方 NitroGen 推理硬编码 CUDA（`model.to("cuda")`），**必须有 NVIDIA GPU**。不同显卡架构对应不同 PyTorch + CUDA 索引版本，用自适应脚本自动匹配：
 
@@ -172,20 +176,26 @@ NitroGen\.venv\Scripts\python.exe -c "from huggingface_hub import hf_hub_downloa
 
 **一键启动**（自动停旧实例 → 启动后端 → 打开浏览器）：
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\start_web.ps1
-```
+- **方式 1（推荐，双击即可）**：直接双击 `scripts\start_web.bat`（它是 start_web.ps1 的壳，报错不会闪退，可查看错误后按回车关闭）
+- **方式 2（命令行）**：
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File scripts\start_web.ps1
+  ```
 
-**分步启动**（同效）：
+> `start_web.ps1` 内部完成：停掉旧 app.py → 清日志 → 后台启动 Flask → 等端口 5000 就绪（最多 15s）→ 自动打开浏览器。日志在 `data\app.log` / `data\app.err.log`。
+
+**直接运行**（不用一键脚本，适合已在调试场景）：
 
 ```powershell
 NitroGen\.venv\Scripts\python.exe scripts\app.py   # 监听 http://localhost:5000
 ```
 
+> 与一键启动的区别：直接运行**不会**自动停旧实例 / 自动打开浏览器；停止需 `Ctrl+C`。一般情况用上面的一键启动即可。
+
 **停止**：
 
-- 一键脚本：窗口按回车即关闭（脚本内已停旧进程）；
-- 手动分步启动：`Ctrl+C`；若端口被占：
+- **一键启动（bat/ps1）**：窗口按回车即关闭（脚本内已停旧进程）；
+- **直接运行（app.py）**：`Ctrl+C`；若端口被占，强制停：
   `Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -like "*app.py*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`
 
 ### 数据 / 评估命令行
