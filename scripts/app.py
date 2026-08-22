@@ -484,9 +484,13 @@ def api_stats():
             "j_right": _downsample(jr_arr, 4000),
         },
         "plots": {
-            "button_press_dist": _plot_url(stats_dir / "button_press_dist.png"),
-            "joystick_dist": _plot_url(stats_dir / "joystick_dist.png"),
-            "sequences": _plot_url(stats_dir / "sequences.png"),
+            # 按视频优先（button_press_dist_<video>.png），回退游戏级（button_press_dist.png）
+            "button_press_dist": _plot_url(stats_dir / f"button_press_dist_{video}.png")
+                                 or _plot_url(stats_dir / "button_press_dist.png"),
+            "joystick_dist": _plot_url(stats_dir / f"joystick_dist_{video}.png")
+                             or _plot_url(stats_dir / "joystick_dist.png"),
+            "sequences": _plot_url(stats_dir / f"sequences_{video}.png")
+                         or _plot_url(stats_dir / "sequences.png"),
             "shift_scan": _plot_url(DATA_ROOT / game / "eval" / f"shift_scan_{video}.png")
                           or _plot_url(DATA_ROOT / game / "eval" / "shift_scan.png"),
         },
@@ -507,6 +511,107 @@ def _plot_url(p: Path) -> str | None:
     if p.exists():
         return "/files/" + str(p.relative_to(DATA_ROOT)).replace("\\", "/")
     return None
+
+
+# --------------------------------------------------------------------------
+# API 4.5: 核心指标对比（测试集约 200 帧 + zero-shot 参考水平）
+# 让"按键一致率 / 摇杆相关系数 / 摇杆 MSE"与参考水平直白对照、达标可判。
+# --------------------------------------------------------------------------
+REFERENCE = {
+    "acc_17keys": 0.50,   # zero-shot 参考：按键一致率约 50%
+    "corr_jl": 0.40,      # zero-shot 参考：摇杆相关系数约 0.4
+    "test_frames": 200,   # 测试集约 200 帧量级
+}
+
+
+@app.get("/api/metrics")
+def api_metrics():
+    """核心指标对比。支持 ?shift=k 实时查看任意动作块步偏移下的指标；
+    缺省/auto 用评估记录的最优 shift。数据来自 metrics_<video>.csv（shift 0~17 全行）。"""
+    game = request.args.get("game", "").strip()
+    video = request.args.get("video", "").strip()
+    if not game or not video:
+        return err("参数 game/video 必填")
+    assert_lineage(game, video)
+
+    row = db_query("SELECT * FROM eval_results WHERE game=? AND video=?",
+                   (game, video), one=True)
+    if row is None:
+        return err(f"「{game}/{video}」尚未评估，请先在 Tab③ 运行评估", 404)
+
+    # 读 metrics 明细（shift 0~17 全行，优先按视频隔离文件）
+    import csv as _csv
+    metrics_rows = []
+    for cand in (DATA_ROOT / game / "eval" / f"metrics_{video}.csv",
+                 DATA_ROOT / game / "eval" / "metrics.csv"):
+        if cand.exists():
+            metrics_rows = list(_csv.DictReader(open(cand, encoding="utf-8")))
+            break
+
+    # 选定 shift：显式参数 > auto(DB 最优)
+    shift_param = request.args.get("shift", "auto")
+    if shift_param == "auto":
+        shift = int(row["best_shift"])
+    else:
+        try:
+            shift = max(0, min(17, int(shift_param)))
+        except ValueError:
+            return err("shift 必须是 0~17 或 auto", 400)
+
+    # 取该 shift 的指标行；无明细表则回退 DB 行
+    mrow = None
+    if metrics_rows:
+        mrow = next((m for m in metrics_rows if int(m["shift"]) == shift), None)
+    if mrow is not None:
+        acc = float(mrow["acc_17keys_all"])          # B 口径：逐帧全对
+        recall = float(mrow["btn_recall"]) if mrow["btn_recall"] not in ("nan", "") else None
+        precision = float(mrow["btn_precision"]) if mrow["btn_precision"] not in ("nan", "") else None
+        corr_x = float(mrow["corr_jl_x"]) if mrow["corr_jl_x"] not in ("nan", "") else None
+        corr_y = float(mrow["corr_jl_y"]) if mrow["corr_jl_y"] not in ("nan", "") else None
+        mse = float(mrow["mse_jl_x"])
+    else:
+        acc = row["acc_17keys"]
+        recall = row["recall"]
+        precision = row["precision"]
+        corr_x = row["corr_jl_x"]
+        corr_y = row["corr_jl_y"]
+        mse = row["mse_jl"]
+
+    # 摇杆相关系数：x/y 两轴取有效值中的较大者作为综合代表（更乐观口径）
+    vals = [c for c in (corr_x, corr_y)
+            if c is not None and not (isinstance(c, float) and c != c)]
+    corr = max(vals) if vals else 0.0
+
+    return ok({
+        "game": game,
+        "video": video,
+        "test_frames": row["test_frames"],
+        "best_shift": row["best_shift"],
+        "shift": shift,
+        "metrics": {
+            "acc_17keys": acc,
+            "btn_recall": recall,
+            "btn_precision": precision,
+            "corr_jl_x": corr_x,
+            "corr_jl_y": corr_y,
+            "corr_jl": round(float(corr), 4),
+            "mse_jl": mse,
+        },
+        "reference": REFERENCE,
+        "verdicts": {
+            "acc_17keys": acc >= REFERENCE["acc_17keys"],
+            "corr_jl": corr >= REFERENCE["corr_jl"],
+        },
+        # 供前端直白展示的文案
+        "display": {
+            "test_frames": f"测试集 {row['test_frames']} 帧",
+            "acc": f"按键一致率 {acc*100:.1f}%  vs 参考 50%"
+                   + ("  ✅ 达标" if acc >= REFERENCE["acc_17keys"] else "  ❌ 未达"),
+            "corr": f"摇杆相关系数 {corr:.2f}  vs 参考 0.40"
+                    + ("  ✅ 达标" if corr >= REFERENCE["corr_jl"] else "  ❌ 未达"),
+            "mse": f"摇杆 MSE {mse:.3f}",
+        },
+    })
 
 
 # --------------------------------------------------------------------------
@@ -861,7 +966,8 @@ def api_rescan_status():
         scope_urls = scan.get(_rescan_scope[5:], {}).get("urls", [])
     total = len(scope_urls) if _rescan_scope else None
     if total:
-        scope_status = [vstatus[u["video"]].get("status", "unknown") for u in scope_urls]
+        # 容错：video_status.json 可能缺该 video（未探测/探测列表与 games_scan 不一致），按 unknown 处理，避免 KeyError -> 500
+        scope_status = [vstatus.get(u["video"], {}).get("status", "unknown") for u in scope_urls]
         cnt = Counter(scope_status)
         done = len(scope_status)
     else:
@@ -917,8 +1023,11 @@ def _run_genplots(game: str, video: str):
         return proc.returncode, text
 
     try:
-        # 1) 统计图（stats_viz.py，需 matplotlib+pandas）
-        rc1, out1 = run([sys.executable, str(REPO / "scripts" / "stats_viz.py"), "--game", game])
+        # 1) 统计图（stats_viz.py，需 matplotlib+pandas；带 --video 则按视频生成）
+        cmd1 = [sys.executable, str(REPO / "scripts" / "stats_viz.py"), "--game", game]
+        if video:
+            cmd1 += ["--video", video]
+        rc1, out1 = run(cmd1)
         if rc1 != 0:
             raise RuntimeError(f"stats_viz.py 失败（退出码 {rc1}）: {out1[-300:]}")
 

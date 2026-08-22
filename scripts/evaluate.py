@@ -2,7 +2,7 @@
 """通用 zero-shot 评估脚本（原 evaluate_hades.py 的通用化版本）。
 
 支持任意已提取标注 + 已下载视频的 (game, video)：
-1. 若无 test_set.csv：分层抽样构建测试集（每 chunk 均匀抽帧 + ffmpeg 抽帧）
+1. 若无 test_set.csv：抽样构建测试集（默认纯随机，论文口径约 500 帧量级；--seq-mode 抽连续片段序列集）+ ffmpeg 抽帧
 2. 加载 ng.pt 逐帧推理 -> 18 步动作块
 3. shift 0~17 全扫描 -> metrics.csv
 4. 最优 shift 逐帧对照 -> predictions.csv（含预测按键明细 pred_* 列）
@@ -98,8 +98,20 @@ def locate_video(game: str, video: str | None) -> tuple[str, Path]:
 
 
 def build_testset(game: str, video: str, video_file: Path, fps: int,
-                  test_size: int, seed: int, csv_path: Path | None = None) -> list[dict]:
-    """分层抽样 + ffmpeg 抽帧，生成测试集 CSV（逻辑与 build_hades_testset.py 一致）。
+                  test_size: int, seed: int, csv_path: Path | None = None,
+                  sample_mode: str = "random",
+                  seq_segments: int = 0, seq_len: int = 50) -> list[dict]:
+    """抽样 + ffmpeg 抽帧，生成测试集 CSV。
+
+    sample_mode：
+      - "random"     （默认，论文口径）纯随机均匀抽样：从视频全部可抽帧范围随机抽
+                     test_size 帧（默认 500，约 500 帧量级），代表整体分布，
+                     用于报告按键一致率 + 摇杆 MSE/相关。
+      - "stratified" （旧行为）按 chunk 均摊抽样，每 chunk 抽 test_size/总chunk 帧。
+    seq_segments/seq_len：>0 时改为"连续片段"抽样（论文口径的序列集），
+                     在视频内随机抽 seq_segments 段 × 每段 seq_len 连续帧，
+                     总帧数 ≈ seq_segments*seq_len（默认 10×50=500 帧），
+                     用于 Tab③ 序列可视化 + Tab② 统计分布，序列具时序连续性。
 
     默认写 test_set_<video>.csv（按视频隔离，多视频游戏互不覆盖）。
     """
@@ -111,18 +123,63 @@ def build_testset(game: str, video: str, video_file: Path, fps: int,
     out_dir = DATA_ROOT / game / "test_frames"
     out_dir.mkdir(parents=True, exist_ok=True)
     ffmpeg = find_ffmpeg()
-
-    per_chunk = (test_size + len(chunks) - 1) // len(chunks)
     rng = random.Random(seed)
-    samples = []
-    for c in chunks:
-        for fid in sorted(rng.sample(range(c["rows"]), k=min(per_chunk, c["rows"]))):
+
+    if seq_segments > 0:
+        # 连续片段抽样：随机抽 seq_segments 段起点，每段 seq_len 连续帧（不跨 chunk）
+        samples = []
+        seg = 0
+        while seg < seq_segments:
+            c = rng.choice(chunks)
+            max_start = max(0, c["rows"] - seq_len)
+            start = rng.randrange(max_start + 1)
+            for fid in range(seq_len):
+                absolute_frame = c["start_frame"] + start + fid
+                samples.append({
+                    "video": video, "chunk": c["chunk"], "frame_idx": start + fid,
+                    "absolute_frame": absolute_frame, "second": absolute_frame / fps,
+                    "seq_id": seg,
+                })
+            seg += 1
+        print(f"[build_testset] 连续片段抽样: {seq_segments}段 x {seq_len}帧 = {len(samples)} 帧")
+    elif sample_mode == "stratified":
+        # 旧行为：按 chunk 均摊
+        per_chunk = (test_size + len(chunks) - 1) // len(chunks)
+        samples = []
+        for c in chunks:
+            for fid in sorted(rng.sample(range(c["rows"]), k=min(per_chunk, c["rows"]))):
+                absolute_frame = c["start_frame"] + fid
+                samples.append({
+                    "video": video, "chunk": c["chunk"], "frame_idx": fid,
+                    "absolute_frame": absolute_frame, "second": absolute_frame / fps,
+                })
+        samples = samples[:test_size]
+    else:
+        # 纯随机均匀抽样（论文口径）：全视频可抽帧范围随机抽 test_size 帧
+        total = sum(c["rows"] for c in chunks)
+        # 全局帧号 -> chunk 映射：off[i] 为 chunk i 的全局起始偏移
+        off = [0]
+        for c in chunks[:-1]:
+            off.append(off[-1] + c["rows"])
+        picked = sorted(rng.sample(range(total), k=test_size))
+        samples = []
+        for g in picked:
+            # 二分找 g 落在哪个 chunk 区间
+            lo, hi = 0, len(chunks) - 1
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if off[mid] <= g:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            c = chunks[lo]
+            fid = g - off[lo]
             absolute_frame = c["start_frame"] + fid
             samples.append({
                 "video": video, "chunk": c["chunk"], "frame_idx": fid,
                 "absolute_frame": absolute_frame, "second": absolute_frame / fps,
             })
-    samples = samples[:test_size]
+        print(f"[build_testset] 纯随机抽样: {len(samples)} 帧（全视频 {total} 帧范围）")
 
     ann_lookup = {
         (r["video"], r["chunk"], r["frame_idx"]): r
@@ -198,9 +255,9 @@ def save_to_db(game, video, stats_frames, metrics, best_k, test_csv: Path):
          best["acc_17keys_all"], best["btn_recall"], best["btn_precision"],
          best["corr_jl_x"], best["corr_jl_y"], best["mse_jl_x"],
          best_k,
-         f"data/{game}/stats/button_press_dist.png",
-         f"data/{game}/stats/sequences.png",
-         f"data/{game}/eval/shift_scan.png",
+         f"data/{game}/stats/button_press_dist_{video}.png",
+         f"data/{game}/stats/sequences_{video}.png",
+         f"data/{game}/eval/shift_scan_{video}.png",
          f"data/{game}/{test_csv.name}"),
     )
     conn.commit()
@@ -208,15 +265,19 @@ def save_to_db(game, video, stats_frames, metrics, best_k, test_csv: Path):
     print(f"DB updated: {game}/{video} (acc17={best['acc_17keys_all']:.3f}, shift={best_k})")
 
 
-def ensure_stats(game: str):
-    """若无统计图，调用 stats_viz.py 生成。"""
+def ensure_stats(game: str, video: str | None = None):
+    """若无统计图，调用 stats_viz.py 生成（带 video 则按视频生成）。"""
     stats_dir = DATA_ROOT / game / "stats"
-    need = ["button_press_dist.png", "joystick_dist.png", "sequences.png", "stats_summary.csv"]
+    suffix = f"_{video}" if video else ""
+    need = [f"button_press_dist{suffix}.png", f"joystick_dist{suffix}.png",
+            f"sequences{suffix}.png", f"stats_summary{suffix}.csv"]
     if all((stats_dir / n).exists() for n in need):
         return
     print("generating stats plots ...")
-    subprocess.run([sys.executable, str(REPO / "scripts" / "stats_viz.py"), "--game", game],
-                   check=True)
+    cmd = [sys.executable, str(REPO / "scripts" / "stats_viz.py"), "--game", game]
+    if video:
+        cmd += ["--video", video]
+    subprocess.run(cmd, check=True)
 
 
 def plot_shift_scan(game: str, video: str):
@@ -238,9 +299,16 @@ def main():
     ap.add_argument("--game", required=True)
     ap.add_argument("--video", default=None)
     ap.add_argument("--fps", type=int, default=None, help="视频帧率（构建测试集时必填）")
-    ap.add_argument("--test-size", type=int, default=200)
+    ap.add_argument("--test-size", type=int, default=500,
+                    help="测试集帧数（论文口径约 500 帧量级；旧 200 帧偏少，用户 2026-08-22 指出）")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--rebuild-testset", action="store_true", help="强制重建测试集")
+    ap.add_argument("--sample-mode", choices=["random", "stratified"], default="random",
+                    help="抽样方式：random=纯随机（论文口径，默认）/ stratified=按chunk均摊（旧行为）")
+    ap.add_argument("--seq-mode", action="store_true",
+                    help="序列集模式：抽 seq_segments 段 × seq_len 连续帧（论文口径，默认 10×50=500 帧）")
+    ap.add_argument("--seq-segments", type=int, default=10, help="连续片段段数（--seq-mode 下）")
+    ap.add_argument("--seq-len", type=int, default=50, help="每段连续帧数（--seq-mode 下）")
     args = ap.parse_args()
 
     game_dir = DATA_ROOT / args.game
@@ -251,28 +319,45 @@ def main():
     print(f"[setup] game={args.game} video={video} file={video_file.name}")
 
     # 1) 测试集（按视频隔离：test_set_<video>.csv 优先；兼容旧版单文件 test_set.csv）
+    # 帧数校验：复用前检查帧数是否与 --test-size 一致，不一致（旧 200 帧 → 新 500 帧）自动删除重建，
+    # 保证前端点一次"运行评估"即自动切换到当前口径，无需手动删旧测试集。
     test_csv = game_dir / f"test_set_{video}.csv"
     if args.rebuild_testset:
         test_csv.unlink(missing_ok=True)
     if test_csv.exists():
         rows = list(csv.DictReader(open(test_csv, encoding="utf-8")))
         rows = [r for r in rows if r["video"] == video]
-        print(f"[setup] reuse test set: {len(rows)} frames -> {test_csv.name}")
+        if len(rows) == args.test_size:
+            print(f"[setup] reuse test set: {len(rows)} frames -> {test_csv.name}")
+        else:
+            print(f"[setup] test set 帧数 {len(rows)} != --test-size {args.test_size}，重建（新口径）")
+            test_csv.unlink(missing_ok=True)
+            rows = []
     else:
         # 旧版单文件里可能有该视频的帧（如 v1805686899 在 test_set.csv）
         legacy = game_dir / "test_set.csv"
         if legacy.exists() and not args.rebuild_testset:
             rows = [r for r in csv.DictReader(open(legacy, encoding="utf-8")) if r["video"] == video]
-            if rows:
+            if len(rows) == args.test_size:
                 print(f"[setup] reuse legacy test set: {len(rows)} frames -> {legacy.name}")
                 test_csv = legacy
+            else:
+                print(f"[setup] legacy test set 帧数 {len(rows)} != --test-size {args.test_size}，重建（新口径）")
+                rows = []
         else:
             rows = []
     if not rows:
         if not args.fps:
             raise SystemExit("构建测试集需要 --fps（如 hades v1805686899 为 30，lies_of_p 为 60）")
-        rows = build_testset(args.game, video, video_file, args.fps, args.test_size, args.seed,
-                             csv_path=test_csv)
+        if args.seq_mode:
+            # 序列集模式：抽连续片段，写入 seq_set_<video>.csv
+            test_csv = game_dir / f"seq_set_{video}.csv"
+            rows = build_testset(args.game, video, video_file, args.fps, args.test_size, args.seed,
+                                 csv_path=test_csv,
+                                 seq_segments=args.seq_segments, seq_len=args.seq_len)
+        else:
+            rows = build_testset(args.game, video, video_file, args.fps, args.test_size, args.seed,
+                                 csv_path=test_csv, sample_mode=args.sample_mode)
     assert rows, "测试集为空"
 
     # 2) 标注真值关联（17 键明细）
@@ -317,6 +402,9 @@ def main():
     )
 
     # 4) shift 扫描
+    # 按键一致率主口径 = B（逐帧全对：17 键全部一致才算该帧对），
+    # 与课程参考水平"约 50%"对齐（口径敏感性分析见项目备忘 八·五 补充口径 3）。
+    # 同时保留 A 口径（逐键逐帧）acc_17keys_bits 作对照。
     metrics = []
     for k in range(18):
         pred_btn17 = buttons_all[:, k, :][:, MODEL17_IDX] >= 0.5
@@ -326,7 +414,8 @@ def main():
         n_gp = int((gt_any & pred_any).sum())
         m = {
             "shift": k,
-            "acc_17keys_all": float((pred_btn17 == gt_btn).mean()),
+            "acc_17keys_all": float((pred_btn17 == gt_btn).all(axis=1).mean()),  # B: 逐帧全对
+            "acc_17keys_bits": float((pred_btn17 == gt_btn).mean()),            # A: 逐键逐帧（对照）
             "btn_recall": n_gp / int(gt_any.sum()) if gt_any.sum() else float("nan"),
             "btn_precision": n_gp / int(pred_any.sum()) if pred_any.sum() else float("nan"),
             "mse_jl_x": float(((pred_jl[:, 0] - gt_jl[:, 0]) ** 2).mean()),
@@ -376,7 +465,7 @@ def main():
     # 6) 入库 + 统计图 + shift 扫描图
     stats_frames = int(ann.filter(pl.col("video") == video).height)
     save_to_db(args.game, video, stats_frames, metrics, best_k, test_csv)
-    ensure_stats(args.game)
+    ensure_stats(args.game, video)
     plot_shift_scan(args.game, video)
     print(f"DONE -> {eval_dir}")
 

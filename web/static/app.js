@@ -138,7 +138,7 @@ async function loadVideos(presetVideo) {
       const o = document.createElement("option");
       o.value = v.video;
       const st = { downloaded: "已下载✅", available: "可下载", dead: "失效❌", unknown: "状态未知" }[v.status] || v.status;
-      const t = v.tested ? ` · 已测 acc=${(v.acc_17keys * 100).toFixed(1)}%` : "";
+      const t = v.tested ? ` · 已测 acc17=${(v.acc_17keys * 100).toFixed(1)}%` : "";
       o.textContent = `${v.video}（${st}${t}）`;
       o.title = v.status === "unknown" ? (v.error || "未探测，可点「探测链接」验证") : "";
       sel.appendChild(o);
@@ -173,6 +173,44 @@ async function onVideoChange(video) {
   } catch (e) {
     setLineage(`${state.game} / ${video}（无测试集，请先运行评估脚本）`, "warn");
     showError(e.message);
+  }
+  // 核心指标对比条
+  loadMetricsBanner();
+}
+
+// ---------------- 核心指标对比条（zero-shot 结果 vs 参考水平，随 shift 实时变化） ----------------
+async function loadMetricsBanner() {
+  const banner = document.getElementById("metricsBanner");
+  try {
+    // 跟随当前 shift 选择器（auto=最优；具体 k 则实时返回该步指标）
+    const shift = (document.getElementById("shiftSelect") || {}).value || "auto";
+    const d = await api(`/api/metrics?game=${encodeURIComponent(state.game)}&video=${encodeURIComponent(state.video)}&shift=${shift}`);
+    banner.classList.remove("hidden");
+    const shiftLabel = shift === "auto" ? `shift k=${d.best_shift}(最优)` : `shift k=${shift}`;
+    document.getElementById("metricsScope").textContent =
+      `${d.game} / ${d.video} · ${d.metrics.test_frames ?? d.test_frames} 帧 · ${shiftLabel}`;
+    const m = d.metrics, ref = d.reference, v = d.verdicts;
+    const chips = [
+      { label: "按键一致率(逐帧全对)", value: (m.acc_17keys * 100).toFixed(1) + "%",
+        vs: `参考 ${(ref.acc_17keys * 100).toFixed(0)}%（17键全一致帧占比）`, good: v.acc_17keys, neutral: false },
+      { label: "按键召回率", value: (m.btn_recall * 100).toFixed(1) + "%",
+        vs: "—", good: null, neutral: true },
+      { label: "摇杆相关系数", value: m.corr_jl.toFixed(2),
+        vs: `参考 ${ref.corr_jl.toFixed(2)}`, good: v.corr_jl, neutral: false },
+      { label: "摇杆 MSE (x)", value: m.mse_jl != null ? m.mse_jl.toFixed(3) : "—",
+        vs: "越小越好", good: null, neutral: true },
+    ];
+    document.getElementById("metricsChips").innerHTML = chips.map(c => {
+      const cls = c.neutral ? "neutral" : (c.good ? "good" : "bad");
+      const flag = c.neutral ? "" : (c.good ? " ✅" : " ❌");
+      return `<div class="metric-chip ${cls}">
+        <div class="mc-label">${c.label}</div>
+        <div class="mc-value">${c.value}${flag}</div>
+        <div class="mc-vs">${c.vs}</div>
+      </div>`;
+    }).join("");
+  } catch (e) {
+    banner.classList.add("hidden");  // 未评估或无测试集时隐藏
   }
 }
 
@@ -210,6 +248,7 @@ function onFrameInput(val) {
 async function stepFrame(dir) { await selectFrame(state.frameIdx + dir); }
 function onShiftChange(val) {
   if (state.frames[state.frameIdx]) fetchFrame(state.frames[state.frameIdx].absolute_frame, val);
+  loadMetricsBanner();  // 顶部指标条随 shift 实时刷新
 }
 
 async function fetchFrame(frame, shiftOverride) {
@@ -255,7 +294,7 @@ function renderFrameResult(d) {
   const m = d.metrics;
   const acc = 1 - m.n_mismatch / 17;
   document.getElementById("frameMetrics").innerHTML = `
-    ${metricCard((acc * 100).toFixed(1) + "%", "本帧按键一致率(17键)", acc > 0.9 ? "good" : "")}
+    ${metricCard((acc * 100).toFixed(1) + "%", "本帧17键一致率", acc > 0.9 ? "good" : "")}
     ${metricCard(m.n_mismatch, "差异键数", m.n_mismatch === 0 ? "good" : "bad")}
     ${metricCard(m.gt_n_press + " → " + m.pred_n_press, "按键数 (真值→预测)")}
     ${metricCard(d.shift, "对齐 shift k")}

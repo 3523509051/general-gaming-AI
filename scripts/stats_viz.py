@@ -46,6 +46,7 @@ N_SEQ = 10
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--game", default="hades")
+    ap.add_argument("--video", default=None, help="只统计指定视频（默认整个游戏全量合并）")
     ap.add_argument("--annotations", default=None, help="直接指定 parquet 路径（覆盖 --game）")
     args = ap.parse_args()
 
@@ -63,7 +64,15 @@ def main():
 
     print(f"reading {parquet}")
     df = pd.read_parquet(parquet)
-    print(f"rows: {df.shape[0]}, cols: {df.shape[1]}")
+    # 按视频过滤：--video 指定时只统计该视频，输出文件名带 _<video> 后缀
+    video_suffix = ""
+    scope_label = f"全量 {df.shape[0]:,} 帧"
+    if args.video:
+        assert "video" in df.columns, "数据缺少 video 列，无法按视频过滤"
+        df = df[df["video"] == args.video]
+        video_suffix = f"_{args.video}"
+        scope_label = f"视频 {args.video}（{df.shape[0]:,} 帧）"
+    print(f"rows: {df.shape[0]}, cols: {df.shape[1]}, scope: {scope_label}")
 
     missing = [c for c in BUTTON_COLS if c not in df.columns]
     assert not missing, f"缺失按键列: {missing}"
@@ -78,14 +87,14 @@ def main():
     ax.set_xticklabels(press_rate.index, rotation=45, ha="right")
     ax.set_xlabel("按键")
     ax.set_ylabel("触发率 (%)")
-    ax.set_title(f"{game}：按键触发率分布（全量 {df.shape[0]:,} 帧）")
+    ax.set_title(f"{game}：按键触发率分布（{scope_label}）")
     for b, v in zip(bars, press_rate.values * 100):
         ax.text(b.get_x() + b.get_width() / 2, v + 0.3, f"{v:.1f}",
                 ha="center", va="bottom", fontsize=8)
     fig.tight_layout()
-    fig.savefig(out_dir / "button_press_dist.png", dpi=150)
+    fig.savefig(out_dir / f"button_press_dist{video_suffix}.png", dpi=150)
     plt.close(fig)
-    print("saved button_press_dist.png")
+    print(f"saved button_press_dist{video_suffix}.png")
 
     # ---------- 2. 摇杆取值分布 ----------
     jl = np.array(df["j_left"].to_list())   # (N, 2)
@@ -112,9 +121,9 @@ def main():
         ax.set_title(f"{'左' if name == 'left' else '右'}摇杆 x/y 边缘分布")
         ax.legend()
     fig.tight_layout()
-    fig.savefig(out_dir / "joystick_dist.png", dpi=150)
+    fig.savefig(out_dir / f"joystick_dist{video_suffix}.png", dpi=150)
     plt.close(fig)
-    print("saved joystick_dist.png")
+    print(f"saved joystick_dist{video_suffix}.png")
 
     # ---------- 3. 10 条连续动作序列曲线 ----------
     # 均匀抽样 10 个起点（不重叠）
@@ -159,9 +168,9 @@ def main():
             ax.legend(fontsize=8)
 
     fig.tight_layout()
-    fig.savefig(out_dir / "sequences.png", dpi=150)
+    fig.savefig(out_dir / f"sequences{video_suffix}.png", dpi=150)
     plt.close(fig)
-    print("saved sequences.png")
+    print(f"saved sequences{video_suffix}.png")
 
     # ---------- 4. 汇总 CSV ----------
     jl_min, jl_max = jl.min(axis=0), jl.max(axis=0)
@@ -176,7 +185,7 @@ def main():
         "press_rate": press_rate.values,
         "press_count": btn.sum().loc[press_rate.index].values,
     })
-    summary.to_csv(out_dir / "stats_summary.csv", index=False)
+    summary.to_csv(out_dir / f"stats_summary{video_suffix}.csv", index=False)
 
     print(f"\n--- 汇总 ---")
     print(f"总帧数    : {df.shape[0]:,}")
