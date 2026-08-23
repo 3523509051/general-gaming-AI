@@ -38,6 +38,15 @@ from flask import Flask, jsonify, request, send_file, send_from_directory
 
 REPO = Path(__file__).resolve().parent.parent
 DATA_ROOT = REPO / "data"
+
+# 进程身份守卫：只允许用 venv python 运行本服务。
+# 现象：曾出现 venv 的 app.py 被系统 python（pythoncore-3.10）重复拉起，导致双实例/旧代码抢占端口。
+# 此处检测到"非 venv python 运行本脚本"时直接退出，仅保留 venv 实例服务。
+_VENV_PY = REPO / "NitroGen" / ".venv" / "Scripts" / "python.exe"
+if Path(sys.executable).resolve() != _VENV_PY.resolve():
+    print("错误: app.py 必须用 NitroGen\\.venv\\Scripts\\python.exe 运行，当前使用: "
+          f"{sys.executable}\n请改用 start_web.bat 或 venv python 启动。")
+    raise SystemExit(2)
 WEB_DIR = REPO / "web"
 DB_PATH = DATA_ROOT / "eval_results.db"
 GAMES_SCAN = DATA_ROOT / "games_scan.json"
@@ -1026,7 +1035,7 @@ def api_rescan():
         if _rescan_proc is not None and _rescan_proc.poll() is None:
             return jsonify({"ok": True, "data": {"status": "running",
                                                  "started": True, "already": True}})
-        args = [shutil.which("python") or sys.executable,
+        args = [sys.executable,   # 强制 venv python，避免 shutil.which 解析到系统 python
                 str(REPO / "scripts" / "probe_videos.py")]
         if scope == "full":
             args.append("--full")
@@ -1332,8 +1341,7 @@ def _run_download(game: str, video: str, url: str):
     if exe:
         cmd = [exe]
     else:
-        py = shutil.which("python") or sys.executable
-        cmd = [py, "-m", "yt_dlp"]
+        cmd = [sys.executable, "-m", "yt_dlp"]   # 强制 venv python
     cmd += ["--newline", "--no-warnings", "-f", "bv*[height<=720]+ba/b",
             "--merge-output-format", "mp4", "-o", str(out)]
     # YouTube bot 验证（"Sign in to confirm you're not a bot"）规避：

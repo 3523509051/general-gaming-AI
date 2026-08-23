@@ -41,40 +41,17 @@ try {
     Write-Host "2/4 清理日志..." -ForegroundColor Cyan
     Remove-Item $logOut, $logErr -Force -ErrorAction SilentlyContinue
 
-    # 3) 后台启动 Flask（隐藏窗口，不阻塞当前控制台）
+    # 3) 前台运行 Flask（随窗口退出：关窗口 / Ctrl+C 即停止服务）
     Write-Host "3/4 启动 Flask 后端（首次访问 /api/frame 时加载模型）..." -ForegroundColor Cyan
-    $proc = Start-Process -FilePath $py -ArgumentList "scripts\app.py" `
-        -WorkingDirectory $root -WindowStyle Hidden `
-        -RedirectStandardOutput $logOut -RedirectStandardError $logErr -PassThru
-
-    # 4) 探测 5000 端口就绪（最多等 15 秒）
-    Write-Host "4/4 等待端口 5000 就绪..." -ForegroundColor Cyan
-    $ready = $false
-    for ($i = 0; $i -lt 30; $i++) {
-        Start-Sleep -Milliseconds 500
-        if (Test-Port 5000) { $ready = $true; break }
-        if ($proc.HasExited) { break }
-    }
-    if (-not $ready) {
-        $tail = ""
-        if (Test-Path $logErr) {
-            $tail = (Get-Content $logErr -Tail 15 -ErrorAction SilentlyContinue) -join "`n"
-        }
-        throw "服务未就绪。`n--- app.err.log 末尾 ---`n$tail"
-    }
-
+    Write-Host "     按 Ctrl+C 或关闭此窗口即可停止服务" -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "启动成功: http://localhost:5000" -ForegroundColor Green
-    Write-Host "日志: data\app.log / data\app.err.log"
+    Write-Host "地址: http://localhost:5000" -ForegroundColor Green
     Start-Process "http://localhost:5000"
+    # 前台运行，Flask 独占此控制台；窗口关闭或 Ctrl+C 时进程随之退出。
+    & $py "scripts\app.py"
 }
 catch {
     Write-Host ""
     Write-Host "启动失败: $($_.Exception.Message)" -ForegroundColor Red
     Write-Host "（可查看 data\app.err.log 定位具体原因）"
-}
-finally {
-    Write-Host ""
-    Write-Host "按回车键关闭此窗口..."
-    Read-Host | Out-Null
 }
