@@ -41,17 +41,50 @@ try {
     Write-Host "2/4 清理日志..." -ForegroundColor Cyan
     Remove-Item $logOut, $logErr -Force -ErrorAction SilentlyContinue
 
-    # 3) 前台运行 Flask（随窗口退出：关窗口 / Ctrl+C 即停止服务）
+    # 3) 后台启动 Flask（隐藏窗口）；关闭本窗口时由 finally 停止服务
     Write-Host "3/4 启动 Flask 后端（首次访问 /api/frame 时加载模型）..." -ForegroundColor Cyan
-    Write-Host "     按 Ctrl+C 或关闭此窗口即可停止服务" -ForegroundColor DarkGray
+    $flaskProc = Start-Process -FilePath $py -ArgumentList "scripts\app.py" `
+        -WorkingDirectory $root -WindowStyle Hidden `
+        -RedirectStandardOutput $logOut -RedirectStandardError $logErr -PassThru
+
+    # 4) 等待端口 5000 就绪（最多 15s）
+    Write-Host "4/4 等待端口 5000 就绪..." -ForegroundColor Cyan
+    $ready = $false
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Milliseconds 500
+        if (Test-Port 5000) { $ready = $true; break }
+        if ($flaskProc.HasExited) { break }
+    }
+    if (-not $ready) {
+        $tail = ""
+        if (Test-Path $logErr) { $tail = (Get-Content $logErr -Tail 15 -ErrorAction SilentlyContinue) -join "`n" }
+        throw "服务未就绪。`n--- app.err.log 末尾 ---`n$tail"
+    }
     Write-Host ""
-    Write-Host "地址: http://localhost:5000" -ForegroundColor Green
+    Write-Host "启动成功: http://localhost:5000" -ForegroundColor Green
+    Write-Host "日志: data\app.log / data\app.err.log"
     Start-Process "http://localhost:5000"
-    # 前台运行，Flask 独占此控制台；窗口关闭或 Ctrl+C 时进程随之退出。
-    & $py "scripts\app.py"
+    Write-Host ""
+    Write-Host "服务正在后台运行。按回车键停止服务并关闭窗口（直接关窗口也会停止）。" -ForegroundColor DarkGray
+    Read-Host | Out-Null
 }
 catch {
     Write-Host ""
     Write-Host "启动失败: $($_.Exception.Message)" -ForegroundColor Red
     Write-Host "（可查看 data\app.err.log 定位具体原因）"
+    Write-Host ""
+    Write-Host "按回车键关闭此窗口..." -ForegroundColor Cyan
+    Read-Host | Out-Null
+}
+finally {
+    # 停止本脚本启动的 Flask 及其全部子进程（taskkill /T 连带杀 venv spawn 出的系统 python 子进程）
+    if ($flaskProc) {
+        taskkill /PID $flaskProc.Id /T /F 2>$null | Out-Null
+    }
+    # 释放端口 5000（兜底，防止残留进程占用）
+    $portPid = (Get-NetTCPConnection -LocalPort 5000 -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -First 1 -ExpandProperty OwningProcess)
+    if ($portPid) {
+        Stop-Process -Id $portPid -Force -ErrorAction SilentlyContinue
+    }
 }
