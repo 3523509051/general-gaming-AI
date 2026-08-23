@@ -1046,6 +1046,7 @@ def api_rescan():
 @app.post("/api/rescan/cancel")
 def api_rescan_cancel():
     """停止正在运行的视频探测（终止 yt-dlp 子进程）。"""
+    global _rescan_proc, _rescan_scope
     with _rescan_lock:
         if _rescan_proc is not None and _rescan_proc.poll() is None:
             try:
