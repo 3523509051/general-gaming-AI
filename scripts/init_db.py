@@ -35,18 +35,19 @@ CREATE TABLE IF NOT EXISTS eval_results (
 );
 """
 
-# 种子数据：2026-08-20 已完成的两次 zero-shot 评估（详见 项目备忘.md）
+# 种子数据：已完成的 zero-shot 评估（B 口径：逐帧全对 acc_17keys；详见 项目备忘.md）
+# stats_frames 为该视频实际标注帧数（非游戏全量合计）；后续 evaluate.py 会 INSERT OR REPLACE 更新。
 SEEDS = [
-    # hades（538,200 帧标注，200 帧测试集，最优 shift k=6）
-    ("hades", "v1805686899", 538200, 200, 0.954, 0.434, 0.388,
-     -0.008, -0.011, 0.609, 6,
+    # hades v1805686899（该视频 29,400 帧，200 帧测试集，B 口径 acc=0.480）
+    ("hades", "v1805686899", 29400, 200, 0.480, 0.672, 0.467,
+     0.043, 0.210, 0.723, 15,
      "data/hades/stats/button_press_dist.png", "data/hades/stats/sequences.png",
-     "data/hades/eval/shift_scan.png", "data/hades/test_set.csv"),
-    # lies_of_p（21,600 帧标注，199 帧测试集，最优 shift k=7）
-    ("lies_of_p", "v2276819038", 21600, 199, 0.960, 0.528, 0.308,
-     0.129, 0.009, 0.441, 7,
+     "data/hades/eval/shift_scan.png", "data/hades/test_set_v1805686899.csv"),
+    # lies_of_p v2276819038（该视频 21,600 帧，488 帧测试集，B 口径 acc=0.447）
+    ("lies_of_p", "v2276819038", 21600, 488, 0.447, 0.411, 0.326,
+     -0.046, -0.031, 0.309, 0,
      "data/lies_of_p/stats/button_press_dist.png", "data/lies_of_p/stats/sequences.png",
-     "data/lies_of_p/eval/shift_scan.png", "data/lies_of_p/test_set.csv"),
+     "data/lies_of_p/eval/shift_scan.png", "data/lies_of_p/test_set_v2276819038.csv"),
 ]
 
 

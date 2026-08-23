@@ -42,7 +42,6 @@ general-gaming-AI/
 │   ├── scan_shard.py     # 一键识别切片：游戏/视频/链接清单（--merge 合并多切片）
 │   ├── extract_game.py   # 通用标注提取（--game/--video/--limit/--shard，自动发现全部切片）
 │   ├── evaluate.py       # 通用 zero-shot 评估（建测试集/推理/shift 扫描/写库）
-│   ├── build_hades_testset.py  # Hades 200 帧测试集构建
 │   ├── stats_viz.py      # 统计可视化（按键/摇杆分布/10 条序列，中文）
 │   ├── plot_shift_scan.py      # shift 扫描曲线（中文，含双摇杆）
 │   ├── init_db.py        # 建 eval_results.db 结果库 + 种子数据
@@ -113,8 +112,12 @@ powershell -ExecutionPolicy Bypass -File scripts\install_torch.ps1 -Install   # 
 ### 4. 安装其余依赖
 
 ```powershell
-NitroGen\.venv\Scripts\python.exe -m pip install -e ".[serve]"          # 官方 nitrogen 运行时
-NitroGen\.venv\Scripts\python.exe -m pip install -r requirements.txt    # 顶层依赖清单（分析 + Web）
+# ① 官方 nitrogen 运行时：必须先进入 NitroGen/ 目录（pyproject.toml 在其中）
+cd NitroGen
+NitroGen\.venv\Scripts\python.exe -m pip install -e ".[serve]"
+cd ..
+# ② 顶层依赖清单（分析 + Web）
+NitroGen\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 > **重要**：官方代码不锁定 transformers 版本，必须锁定 **transformers == 4.57.1**（5.x 有 `SiglipVisionModel.vision_model` 破坏性变更，会导致加载 ng.pt 报 `AttributeError`）：
@@ -164,6 +167,9 @@ SMOKE TEST PASSED
 ```powershell
 # 例：下载 SHARD_0034（本课题已测的 hades / lies_of_p / star_fox_64 所在）
 NitroGen\.venv\Scripts\python.exe -c "from huggingface_hub import hf_hub_download; hf_hub_download('nvidia/NitroGen','actions/SHARD_0034.tar.gz',repo_type='dataset')"
+# 下载会落在 HF 缓存，必须复制到 data/shards/（scan_shard/extract_game 只在该目录找切片）：
+New-Item -ItemType Directory -Path data\shards -Force | Out-Null
+Copy-Item "$env:USERPROFILE\.cache\huggingface\hub\datasets--nvidia--NitroGen\snapshots\*\actions\SHARD_0034.tar.gz" data\shards\ -Force
 ```
 
 **导入新切片（多切片支持）**——切片放在项目 **`data/shards/`** 目录（各自独立，不分片合并）：
@@ -256,7 +262,24 @@ NitroGen\.venv\Scripts\python.exe scripts\plot_shift_scan.py --game <game> --vid
 
 ### 后端接口
 
-`/api/games`（游戏列表含已测标记、按切片分组）、`/api/games/<game>/videos`（视频列表含状态）、`/api/frame`（单帧识别，血缘断言 + shift）、`/api/stats`（统计分布）、`/api/sequences`（序列 + Top-5 + 差异定义）、`/api/testset`（测试集帧列表）、`/api/metrics`（核心指标对比，支持 `?shift=k` 实时）、`/api/rescan`（探测）、`/api/evaluate`（评估，支持 `test_size` 参数）、`/api/download`（下载）、`/api/genplots`（静态图）、`/api/shaders`（本地切片列表）、`/api/scan_shard`（扫描合并切片）、`/api/upload_shard`（拖拽上传切片）。
+除 `/api/games`、`/api/shaders` 外，其余接口均需查询参数 `game=<游戏>&video=<视频>`；`/api/frame` 另需 `frame=<绝对帧号>`；`/api/metrics` 可选 `shift=k`（不传则用最优 shift）。
+
+| 接口 | 必填参数 | 说明 |
+| --- | --- | --- |
+| `/api/games` | 无 | 游戏列表（含已测标记、按切片分组） |
+| `/api/games/<game>/videos` | 路径参数 game | 视频列表（含下载/探测状态） |
+| `/api/frame` | game, video, frame | 单帧识别：血缘断言 + shift + 18 步动作块 |
+| `/api/stats` | game, video | 统计分布（按键/摇杆，全量标注实时算） |
+| `/api/sequences` | game, video | 序列 + Top-5 + 差异定义 |
+| `/api/testset` | game, video | 测试集帧列表 |
+| `/api/metrics` | game, video（shift 可选） | 核心指标对比条 |
+| `/api/rescan` | game（可选，不传全量） | 探测视频链接 |
+| `/api/evaluate` | game, video（test_size 可选） | 触发评估 |
+| `/api/download` | game, video | 触发视频下载 |
+| `/api/genplots` | game, video | 生成静态图 |
+| `/api/shaders` | 无 | 本地切片列表 |
+| `/api/scan_shard` | shard | 扫描合并切片 |
+| `/api/upload_shard` | 文件 | 拖拽上传切片 |
 
 ## 必要环境变量
 
@@ -279,7 +302,7 @@ NitroGen\.venv\Scripts\python.exe scripts\plot_shift_scan.py --game <game> --vid
 
 ## 首跑验证（预期输出）
 
-1. 启动 Web 平台 → 浏览器打开 `http://localhost:5000` → 游戏下拉按切片分组显示 171 个游戏，`hades`/`lies_of_p` 标"已测"。
+1. 启动 Web 平台 → 浏览器打开 `http://localhost:5000` → 游戏下拉按切片分组显示，`hades`/`lies_of_p` 标"已测"。（游戏数取决于已导入切片：仅 SHARD_0034 时 89 个，导入 SHARD_0000/0026/0034 三个分片时为 171 个）
 2. 选 `lies_of_p / v2276819038` → Tab① 选帧 4963 → 手柄可视化 + 指标卡（首次推理需模型加载约 10s）。
 3. 命令行验证：
    ```powershell
@@ -291,7 +314,7 @@ NitroGen\.venv\Scripts\python.exe scripts\plot_shift_scan.py --game <game> --vid
 
 | 包 | 版本 | 备注 |
 | --- | --- | --- |
-| Python | 3.10.11 | |
+| Python | ≥ 3.12（本机实测 3.13.5） | 官方 NitroGen 要求 ≥ 3.12 |
 | torch | 按显卡自适应（见第 3 步兼容表） | 本机实测 2.11.0+cu128（RTX 50 系） |
 | transformers | **4.57.1** | 必须锁 4.x，5.x 不兼容 |
 | diffusers | 0.39.0 | |
