@@ -411,6 +411,10 @@ def main():
         pred_jl, pred_jr = jl_all[:, k, :], jr_all[:, k, :]
         gt_any = gt_btn.sum(axis=1) > 0
         pred_any = pred_btn17.sum(axis=1) > 0
+        gt_none = ~gt_any              # 真值无按键
+        fp_mask = pred_any & gt_none   # 误触发：预测有按键但真值无按键
+        fp_nonidle = fp_mask & ~idle_mask  # 非 IDLE 帧中的误触发（IDLE/无效帧过滤口径）
+        gt_none_nonidle = gt_none & ~idle_mask
         n_gp = int((gt_any & pred_any).sum())
         m = {
             "shift": k,
@@ -418,6 +422,9 @@ def main():
             "acc_17keys_bits": float((pred_btn17 == gt_btn).mean()),            # A: 逐键逐帧（对照）
             "btn_recall": n_gp / int(gt_any.sum()) if gt_any.sum() else float("nan"),
             "btn_precision": n_gp / int(pred_any.sum()) if pred_any.sum() else float("nan"),
+            # 误触发按键率（扩展 B：IDLE/无效帧过滤，目标一：相对过滤前约 -20%）
+            "btn_fpr": float(fp_mask.sum()) / int(gt_none.sum()) if gt_none.sum() else float("nan"),      # 全帧口径（过滤前）
+            "btn_fpr_nonidle": float(fp_nonidle.sum()) / int(gt_none_nonidle.sum()) if gt_none_nonidle.sum() else float("nan"),  # 非IDLE口径（过滤后）
             "mse_jl_x": float(((pred_jl[:, 0] - gt_jl[:, 0]) ** 2).mean()),
             "mse_jl_y": float(((pred_jl[:, 1] - gt_jl[:, 1]) ** 2).mean()),
             "corr_jl_x": pearson(pred_jl[:, 0], gt_jl[:, 0]),
