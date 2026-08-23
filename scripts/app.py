@@ -1425,6 +1425,20 @@ def files(relpath: str):
 
 
 # --------------------------------------------------------------------------
+def _port_in_use(port: int = 5000) -> bool:
+    """检查端口是否已被监听（用于启动守卫，防止双实例）。"""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.3)
+        try:
+            # 用 connect 探测而非 bind：Flask 绑定 0.0.0.0 时，
+            # bind 到 127.0.0.1 仍可能成功，导致守卫失效；connect 则能确认真实监听。
+            s.connect(("127.0.0.1", port))
+            return True
+        except (ConnectionRefusedError, OSError, TimeoutError):
+            return False
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("NitroGen 评估工作台")
@@ -1433,4 +1447,10 @@ if __name__ == "__main__":
     print(f"  模型    : {CKPT}（首次 /api/frame 时加载）")
     print("  地址    : http://localhost:5000")
     print("=" * 60)
+    # 端口守卫：若 5000 已被占用（存在另一个 app.py 实例），直接退出而非叠加监听。
+    # 这是双实例问题的最后一道防线（start_web.ps1 已停旧实例，此处兜底）。
+    if _port_in_use(5000):
+        print("错误: 端口 5000 已被占用，疑似已有 app.py 实例在运行。")
+        print("       请先停止旧实例（或双击 start_web.bat 自动停旧重启）。")
+        raise SystemExit(1)
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)

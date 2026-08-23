@@ -19,7 +19,7 @@ function Test-Port($port) {
 try {
     if (-not (Test-Path $py)) { throw "venv 不存在: $py（请确认已按 README 安装 NitroGen 依赖）" }
 
-    # 1) 停掉旧的 app.py 进程
+    # 1) 停掉旧的 app.py 进程（无论 venv 还是系统 Python，命令行含 app.py 的都停）
     Write-Host "1/4 停止旧实例..." -ForegroundColor Cyan
     Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
         Where-Object { $_.CommandLine -like "*app.py*" } |
@@ -28,6 +28,14 @@ try {
             Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
         }
     Start-Sleep -Seconds 1
+    # 1.5) 兜底：若端口 5000 仍被占用（残留进程），强制释放
+    $portPid = (Get-NetTCPConnection -LocalPort 5000 -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -First 1 -ExpandProperty OwningProcess)
+    if ($portPid) {
+        Write-Host "   端口 5000 被 PID=$portPid 占用，强制释放..."
+        Stop-Process -Id $portPid -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 1
+    }
 
     # 2) 清理旧日志（防止文件被旧进程占用导致重定向失败）
     Write-Host "2/4 清理日志..." -ForegroundColor Cyan
