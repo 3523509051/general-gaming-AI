@@ -32,6 +32,7 @@ import builtins
 import csv
 import os
 import random
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -45,9 +46,12 @@ import numpy as np
 import polars as pl
 from PIL import Image
 
+REPO = Path(__file__).resolve().parent.parent
+if str(REPO / "NitroGen") not in sys.path:
+    sys.path.insert(0, str(REPO / "NitroGen"))  # nitrogen 包所在目录（本地/远程均可靠）
+
 from nitrogen.inference_session import InferenceSession
 
-REPO = Path(__file__).resolve().parent.parent
 DATA_ROOT = REPO / "data"
 CKPT = REPO / "NitroGen" / "ng.pt"
 DB_PATH = DATA_ROOT / "eval_results.db"
@@ -207,7 +211,7 @@ def build_testset(game: str, video: str, video_file: Path, fps: int,
         jr = ann.get("j_right", [0.0, 0.0])
         n_btn = sum(int(ann.get(b, 0)) for b in BUTTON_COLS)
         rows.append({
-            "frame_path": f"{game}\\test_frames\\{out_path.name}",
+            "frame_path": f"{game}/test_frames/{out_path.name}",  # 跨平台正斜杠（Windows/Linux 均可）
             "video": s["video"], "chunk": s["chunk"], "frame_idx": s["frame_idx"],
             "absolute_frame": s["absolute_frame"], "second": round(s["second"], 3),
             "n_button_presses": n_btn,
@@ -243,6 +247,18 @@ def save_to_db(game, video, stats_frames, metrics, best_k, test_csv: Path):
     """评估结果写入 SQLite（Web 平台结果库）。"""
     best = metrics[best_k]
     conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS eval_results (
+          game TEXT NOT NULL, video TEXT NOT NULL,
+          stats_frames INTEGER, test_frames INTEGER,
+          acc_17keys REAL, recall REAL, precision REAL,
+          corr_jl_x REAL, corr_jl_y REAL, mse_jl REAL, best_shift INTEGER,
+          stats_plot TEXT, seq_plot TEXT, shift_scan TEXT, test_set_csv TEXT,
+          PRIMARY KEY (game, video)
+        )
+        """
+    )  # 幂等建表：远程 worker 评估无 DB 时自动创建（本地已有表不受影响）
     conn.execute(
         """
         INSERT OR REPLACE INTO eval_results
@@ -309,7 +325,22 @@ def main():
                     help="序列集模式：抽 seq_segments 段 × seq_len 连续帧（论文口径，默认 10×50=500 帧）")
     ap.add_argument("--seq-segments", type=int, default=10, help="连续片段段数（--seq-mode 下）")
     ap.add_argument("--seq-len", type=int, default=50, help="每段连续帧数（--seq-mode 下）")
+    ap.add_argument("--ckpt", default=None,
+                    help="模型权重路径（默认 NitroGen/ng.pt；微调权重如 NitroGen/ng_finetuned.pt）")
+    ap.add_argument("--no-plots", action="store_true",
+                    help="跳过统计图与 shift 扫描图生成（远程 worker 评估用，避免依赖 stats_viz/plot_shift_scan）")
+    ap.add_argument("--tag", default=None,
+                    help="输出文件标签（默认取 ckpt 文件名去扩展名，如 ng_finetuned；"
+                         "用于写 metrics/predictions 带 tag 副本，供 zero-shot vs 微调对照）")
     args = ap.parse_args()
+
+    # 模型权重：--ckpt 可选（默认 ng.pt）；tag 用于带副本输出的文件名后缀
+    ckpt = Path(args.ckpt) if args.ckpt else CKPT
+    if not ckpt.is_absolute():
+        ckpt = REPO / ckpt
+    if not ckpt.exists():
+        raise SystemExit(f"权重不存在: {ckpt}")
+    tag = args.tag if args.tag is not None else ("" if ckpt == CKPT else ckpt.stem)
 
     game_dir = DATA_ROOT / args.game
     assert (game_dir / "manifest.json").exists(), f"缺少 {game_dir}/manifest.json，请先跑 extract_game.py"
@@ -379,9 +410,9 @@ def main():
     print(f"[setup] linked {(gt_btn.sum(axis=1) >= 0).sum()}/{len(rows)} frames to annotations")
 
     # 3) 推理
-    print("[1/3] loading model ...", flush=True)
+    print(f"[1/3] loading model: {ckpt.name} (tag={tag or '-'}) ...", flush=True)
     t0 = time.time()
-    session = InferenceSession.from_ckpt(str(CKPT))
+    session = InferenceSession.from_ckpt(str(ckpt))
     print(f"      loaded in {time.time()-t0:.1f}s", flush=True)
     preds = []
     t0 = time.time()
@@ -441,6 +472,8 @@ def main():
         w.writerow(metrics[0].keys())
         for m in metrics:
             w.writerow(m.values())
+    if tag:  # 带 tag 副本：供 zero-shot vs 微调对照（主文件保持 Web 兼容）
+        shutil.copy(metrics_csv, eval_dir / f"metrics_{video}_{tag}.csv")
 
     best_k = int(max(metrics, key=lambda m: m["acc_17keys_all"])["shift"])
     print(f"[3/3] best shift k={best_k}, acc17={metrics[best_k]['acc_17keys_all']:.3f}")
@@ -448,7 +481,8 @@ def main():
     # 5) predictions_<video>.csv（含预测明细 pred_* 列；按视频隔离）
     pred_btn17 = buttons_all[:, best_k, :][:, MODEL17_IDX] >= 0.5
     pred_jl, pred_jr = jl_all[:, best_k, :], jr_all[:, best_k, :]
-    with open(eval_dir / f"predictions_{video}.csv", "w", encoding="utf-8", newline="") as f:
+    pred_csv = eval_dir / f"predictions_{video}.csv"
+    with open(pred_csv, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(["frame_path", "video", "chunk", "frame_idx", "absolute_frame", "is_idle",
                     "gt_n_press", "pred_n_press", "gt_jl_x", "gt_jl_y",
@@ -468,12 +502,15 @@ def main():
                 f"{pred_jr[i,0]:.4f}", f"{pred_jr[i,1]:.4f}",
                 n_mismatch,
             ] + [int(v) for v in gt_btn[i]] + [int(v) for v in pred_btn17[i]])
+    if tag:  # 带 tag 副本：供 zero-shot vs 微调逐帧对照
+        shutil.copy(pred_csv, eval_dir / f"predictions_{video}_{tag}.csv")
 
     # 6) 入库 + 统计图 + shift 扫描图
     stats_frames = int(ann.filter(pl.col("video") == video).height)
     save_to_db(args.game, video, stats_frames, metrics, best_k, test_csv)
-    ensure_stats(args.game, video)
-    plot_shift_scan(args.game, video)
+    if not args.no_plots:  # 远程 worker 评估跳过统计图（不依赖 stats_viz/plot_shift_scan）
+        ensure_stats(args.game, video)
+        plot_shift_scan(args.game, video)
     print(f"DONE -> {eval_dir}")
 
 
