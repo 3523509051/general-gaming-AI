@@ -374,6 +374,29 @@ NitroGen\.venv\Scripts\python.exe scripts\evaluate.py --game <game> --video <vid
 
 探测侧（`probe_videos.py`）已内置 **oEmbed 二次确认**：yt-dlp 被 bot 验证拦下时，自动用 YouTube oEmbed 接口（无需登录）确认真实性，避免把有效链接误标为"未知/失效"。
 
+### Twitch 下载（长视频限流与规避）
+
+本课题切片中大量视频源为 **Twitch**（`source: twitch`），实测发现：
+
+**现象**：Twitch VOD 下载到**约 44%（≈50 分钟视频量 / ~800MB）后断流或极速限流**（从几 MB/s 降到几百 KB/s），yt-dlp 重试无效，退出码 1。位置固定（同一视频每次都卡在同一进度），已排除分片损坏（该处片段单独下载正常）。
+
+**原因**：Twitch 对**非订阅/匿名下载**的长 VOD 有累计时长限制（约 50 分钟视频量后触发），属平台侧限制，非 yt-dlp 或本仓库问题。
+
+**有效解法（已实测验证）：cookie 登录态**
+
+Twitch 对**已登录账户**的长 VOD 下载**无此限流**（实测：112 分钟视频用登录态下载 50x 速度完整通过；匿名则固定卡在约 44%）。获取方式（浏览器插件导出）：
+
+1. Edge/Chrome 打开 `https://www.twitch.tv` 并**登录**；
+2. 安装浏览器扩展 **Cookie-Editor**（或 Get cookies.txt LOCALLY），点扩展图标 → **Export** → 格式选 **Netscape**（cookies.txt）；
+3. 把导出内容粘贴保存为 `data/cookies.txt`（UTF-8 编码；`data/` 已整体在 `.gitignore`，登录凭据不会入库）；
+4. 下载流程检测到该文件即自动加 `--cookies`（无需改代码/重启），重新点「⬇ 下载视频」即可突破限流；
+5. 登录态会**过期**（几天~几周），过期后重新导出覆盖即可。
+
+**已否决的路径**：
+1. `--fragment-retries 10 / --retries 10`：能减少偶发断流，但**无法突破累计时长限制**（重试仍被掐）；
+2. `--cookies-from-browser edge`：新版 Chromium（≥127）的 cookie 采用 **app-bound encryption**，yt-dlp 报 `Could not copy Chrome cookie database`（[issue #7271](https://github.com/yt-dlp/yt-dlp/issues/7271)），关闭浏览器也无法读取；
+3. **分段下载**（`--download-sections` 切 <40 分钟段再 concat）：切出的片段时间戳/分片边界与**原视频标注的绝对帧无法对齐**，抽帧会错位，已否决。
+
 ## 首跑验证（预期输出）
 
 1. 启动 Web 平台 → 浏览器打开 `http://localhost:5000` → 游戏下拉按切片分组显示，`hades`/`lies_of_p` 标"已测"。（游戏数取决于已导入切片：仅 SHARD_0034 时 89 个，导入 SHARD_0000/0026/0034 三个分片时为 171 个）

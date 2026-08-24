@@ -2098,20 +2098,39 @@ def api_download():
 def _run_download(game: str, video: str, url: str):
     out = DATA_ROOT / "videos" / f"{game}_{video}.mp4"
     out.parent.mkdir(parents=True, exist_ok=True)
-    # 定位 yt-dlp：PATH 里的 exe，或系统 Python 的模块
+    # 定位 yt-dlp：PATH 里的 exe，或当前 Python（venv 已装 yt-dlp）的模块
     exe = shutil.which("yt-dlp")
     if exe:
         cmd = [exe]
     else:
-        cmd = [sys.executable, "-m", "yt_dlp"]   # 强制 venv python
+        cmd = [sys.executable, "-m", "yt_dlp"]   # venv 已装 yt-dlp
     cmd += ["--newline", "--no-warnings", "-f", "bv*[height<=720]+ba/b",
-            "--merge-output-format", "mp4", "-o", str(out)]
-    # YouTube bot 验证（"Sign in to confirm you're not a bot"）规避：
-    # 优先用 data/cookies.txt（浏览器插件导出，见 README）；PO Token 插件(bgutil)已装时自动生效
+            "--merge-output-format", "mp4",
+            "--retries", "10", "--fragment-retries", "10",
+            "-o", str(out)]
+    # --retries/--fragment-retries：Twitch HLS 分段流断流/超时自动重试，减少"下载到一半失败"
+    # ffmpeg 定位：优先系统 PATH；没有则用 venv 内 imageio-ffmpeg 自带二进制
+    # （Twitch 视频为分离的音视频流，merge 成 mp4 必需 ffmpeg，否则 yt-dlp 退出码 1）
+    ffmpeg_exe = shutil.which("ffmpeg")
+    if not ffmpeg_exe:
+        try:
+            import imageio_ffmpeg
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:  # noqa: BLE001
+            ffmpeg_exe = None
+    if ffmpeg_exe:
+        cmd += ["--ffmpeg-location", ffmpeg_exe]
+    # Twitch 长下载限流 / YouTube bot 验证规避：
+    # 优先 data/cookies.txt（浏览器插件导出，见 README）；否则读 Edge 浏览器登录态
     cookies_file = DATA_ROOT / "cookies.txt"
     if cookies_file.exists():
         cmd += ["--cookies", str(cookies_file)]
+    else:
+        cmd += ["--cookies-from-browser", "edge"]   # 直接读 Edge 中已登录的 cookie
     cmd += [url]
+    # 诊断：yt-dlp 完整输出落盘（长下载中途失败时可查真实原因）
+    dl_log = DATA_ROOT / "downloads.log"
+    log_lines = []
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="replace")
@@ -2122,6 +2141,7 @@ def _run_download(game: str, video: str, url: str):
             line = line.strip()
             if not line:
                 continue
+            log_lines.append(line)
             # 解析 yt-dlp 进度行: "[download]  42.3% of 1.23GiB at 2.1MiB/s ETA 00:10"
             import re
             m = re.search(r"\[download\]\s+([\d.]+)%", line)
@@ -2138,9 +2158,21 @@ def _run_download(game: str, video: str, url: str):
                 _download.update(running=False, pct=100, msg="下载完成")
             clear_cache(game)
         else:
+            # 失败：保留完整日志供诊断，并清理半成品（.part / 残缺 mp4）
+            try:
+                dl_log.write_text("\n".join(log_lines[-80:]), encoding="utf-8")
+            except OSError:
+                pass
+            for p in (out, out.with_suffix(".mp4.part"), out.with_suffix(".mp4.part")):
+                if p.exists():
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
             with _download_lock:
-                _download.update(running=False,
-                                 error=_download.get("error") or f"yt-dlp 退出码 {rc}")
+                _download.update(running=False, error=(
+                    _download.get("error")
+                    or f"yt-dlp 退出码 {rc}（详见 data/downloads.log，尾部80行）"))
     except Exception as e:  # noqa: BLE001
         with _download_lock:
             _download.update(running=False, error=str(e)[:300])
@@ -2161,10 +2193,17 @@ def api_download_status():
 def api_download_cancel():
     with _download_lock:
         if _download["running"] and _download["proc"]:
+            pid = _download["proc"].pid
+            # 杀整个进程树（/T /F）：仅 terminate 杀主进程会让子进程继承 stdout 管道，
+            # 导致读取循环永不 EOF、状态卡在 running（"完全不动"）
             try:
-                _download["proc"].terminate()
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                               capture_output=True, timeout=15)
             except Exception:  # noqa: BLE001
-                pass
+                try:
+                    _download["proc"].terminate()
+                except Exception:  # noqa: BLE001
+                    pass
         d = dict(_download)
         d.pop("proc", None)
     return ok(d)
