@@ -88,8 +88,27 @@ window.addEventListener("DOMContentLoaded", async () => {
       const idx = state.frames.findIndex(f => f.absolute_frame === parseInt(p.get("frame")));
       if (idx >= 0) await selectFrame(idx);
     }
+  } else {
+    // 无 URL 参数：恢复上次关闭时选择的游戏和视频（后端 /api/prefs）
+    try {
+      const prefs = await api("/api/prefs");
+      if (prefs.game) await onGameChange(prefs.game, prefs.video);
+    } catch { /* 恢复失败忽略 */ }
   }
 });
+
+function savePrefs() {
+  if (!state.game || !state.video) return;
+  const p = new URLSearchParams({ game: state.game, video: state.video });
+  // 面板已渲染时总带微调参数（空值=清除该字段）；未渲染时跳过（保留已存参数）
+  const sInp = document.getElementById("ftSamples");
+  const eInp = document.getElementById("ftEpochs");
+  const bInp = document.getElementById("ftBatch");
+  if (sInp) p.set("samples", sInp.value || "");
+  if (eInp) p.set("epochs", eInp.value || "");
+  if (bInp) p.set("batch", bInp.value || "");
+  fetch(`/api/prefs?${p}`, { method: "POST" }).catch(() => {});
+}
 
 async function loadGames() {
   try {
@@ -186,6 +205,7 @@ async function onVideoChange(video) {
   state.loadedTabs = {};
   setLineage(`${state.game} / ${video}`, "ok");
   syncURL();
+  savePrefs();   // 记住本次选择的游戏+视频（重开页面自动恢复）
   // 加载测试集帧列表
   try {
     const d = await api(`/api/testset?game=${encodeURIComponent(state.game)}&video=${encodeURIComponent(video)}`);
@@ -670,6 +690,7 @@ async function loadSequences() {
   const box = document.getElementById("seqChart");
   box.innerHTML = `<div class="loading-block"><div class="spinner"></div>加载序列数据...</div>`;
   document.querySelector("#top5Table tbody").innerHTML = "";
+  renderFinetunePanel();   // 微调对照面板（独立于序列数据，常驻 Tab③）
   try {
     seqData = await api(`/api/sequences?game=${encodeURIComponent(state.game)}&video=${encodeURIComponent(state.video)}`);
     renderDiffDefinition(seqData.diff_definition);
@@ -787,6 +808,330 @@ function pollEvaluate() {
       }
     }
   }, 3000);
+}
+
+// ---------------- 扩展 A：微调对照闭环 ----------------
+const FT_STAGE_TEXT = {
+  idle: "空闲",
+  baseline: "阶段 0/2 · 补零样本基线副本（约 2 分钟）",
+  uploading: "上传游戏数据到远程（仅首次）",
+  finetuning: "阶段 1/2 · 微调训练中",
+  evaluating: "阶段 2/2 · 微调权重评估中（200 帧推理）",
+  done: "已完成",
+  failed: "失败",
+};
+
+let FT_BACKEND_STATE = { mode: "local", remote_url: "", health: null };
+
+function renderFinetunePanel() {
+  const el = document.getElementById("finetuneBody");
+  if (!el) return;
+  if (!state.game || !state.video) {
+    el.innerHTML = `<p class="muted">请先在顶部选择游戏和视频。</p>`;
+    return;
+  }
+  el.innerHTML = `
+    <p class="muted">选样本帧数启动：自动按显卡选 batch → 微调（ng_ft_&lt;N&gt;.pt）→ 微调权重评估 →
+       与零样本基线对照。1k 帧约 10~30 分钟（视 GPU），5k/10k 更久，后台运行可切走。
+       论文依据：微调相对从头训练 +10%~52% 相对提升（任务完成率口径，与本表离线口径不等价）。</p>
+    <div class="eval-guide-form">
+      <label>微调后端：
+        <select id="ftBackend" onchange="onBackendChange()">
+          <option value="local">本机 GPU</option>
+          <option value="remote">远程服务器</option>
+        </select>
+      </label>
+      <span id="ftRemoteBox" style="display:none">
+        <label for="ftRemoteUrl">远程地址：</label>
+        <input id="ftRemoteUrl" type="text" placeholder="http://10.14.3.52:56272" style="width:200px">
+        <label for="ftSshPwd" style="margin-left:8px">SSH密码（缺数据自动上传用）：</label>
+        <input id="ftSshPwd" type="password" placeholder="留空=不修改" style="width:110px">
+        <button class="mini-btn" onclick="setBackend()">连接</button>
+      </span>
+      <span id="ftBackendNote" class="muted"></span>
+    </div>
+    <div class="eval-guide-form" style="margin-top:6px">
+      <label for="ftSamples">样本帧数：</label>
+      <input id="ftSamples" type="number" min="2" max="50000" step="100" value="1000">
+      <label for="ftEpochs" style="margin-left:12px">epochs：</label>
+      <input id="ftEpochs" type="number" min="1" max="5" step="1" value="1" style="width:64px">
+      <label for="ftBatch" style="margin-left:12px">batch（留空=自动）：</label>
+      <input id="ftBatch" type="number" min="1" max="16" step="1" style="width:64px" placeholder="自动">
+      <button id="ftStartBtn" class="primary-btn" onclick="startFinetune()">启动微调并评估</button>
+      <button class="mini-btn" onclick="showFtCompare()">查看对照结果</button>
+    </div>
+    <div id="ftStatus" class="muted" style="margin-top:8px"></div>
+    <div id="ftTerminalBox" style="margin-top:10px">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <span class="muted">运行日志（实时）</span>
+        <span><button class="mini-btn" onclick="clearFtLog()">清空</button></span>
+      </div>
+      <pre id="ftTerminal" style="background:#0d1117;color:#8b949e;font-family:Consolas,Menlo,monospace;font-size:12px;line-height:1.5;padding:10px;border-radius:6px;height:240px;overflow:auto;white-space:pre-wrap;margin-top:4px">（任务启动后在此实时显示微调/评估日志）</pre>
+    </div>
+    <div id="ftCompare" style="margin-top:10px"></div>`;
+  // 载入后端状态 + 恢复任务轮询
+  api("/api/finetune/recover").then(r => {
+    if (r.status === "adopted") {
+      const st = document.getElementById("ftStatus");
+      if (st) st.textContent = `已接管远程运行中的任务（samples=${r.samples}）…`;
+      pollFinetune();
+    } else if (r.status === "recovered") {
+      showError(`已恢复远程完成结果（samples=${r.samples}），对照表已更新`);
+      showFtCompare(r.samples);
+    }
+  }).catch(() => {});
+  api("/api/finetune/backend").then(b => {
+    FT_BACKEND_STATE = b;
+    const sel = document.getElementById("ftBackend");
+    if (sel) sel.value = b.mode;
+    const box = document.getElementById("ftRemoteBox");
+    if (box) box.style.display = b.mode === "remote" ? "inline" : "none";
+    const urlInp = document.getElementById("ftRemoteUrl");
+    if (urlInp) urlInp.value = b.remote_url || "";
+    const note = document.getElementById("ftBackendNote");
+    if (note) {
+      if (b.mode === "remote") {
+        note.textContent = b.health
+          ? `远程 ${b.health.gpu || ""}（${b.health.mem_gb}GB）在线，batch 自动按它分配`
+          : "远程地址未连接（点「连接」测试）";
+      } else {
+        note.textContent = "本机 GPU 微调（评估始终本地）";
+      }
+    }
+  }).catch(() => {});
+  api("/api/finetune/status").then(st => {
+    if (st.running) pollFinetune();
+    else {
+      renderFtStatus(st);
+      refreshFtLog("");   // 非运行中：加载上次任务的历史日志
+    }
+  }).catch(() => {});
+  // 恢复上次填写的微调参数（样本帧数/epochs/batch）
+  api("/api/prefs").then(prefs => {
+    const sInp = document.getElementById("ftSamples");
+    const eInp = document.getElementById("ftEpochs");
+    const bInp = document.getElementById("ftBatch");
+    if (sInp && prefs.samples) sInp.value = prefs.samples;
+    if (eInp && prefs.epochs) eInp.value = prefs.epochs;
+    if (bInp && prefs.batch) bInp.value = prefs.batch;
+  }).catch(() => {});
+}
+
+function onBackendChange() {
+  const sel = document.getElementById("ftBackend");
+  const box = document.getElementById("ftRemoteBox");
+  const urlInp = document.getElementById("ftRemoteUrl");
+  const isRemote = sel && sel.value === "remote";
+  if (box) box.style.display = isRemote ? "inline" : "none";
+  // 切到本机立即保存；切到远程需点「连接」填地址
+  if (!isRemote) setBackend("local", "");
+}
+
+async function setBackend(modeArg, urlArg) {
+  const sel = document.getElementById("ftBackend");
+  const mode = modeArg || (sel ? sel.value : "local");
+  const url = urlArg !== undefined ? urlArg
+    : (document.getElementById("ftRemoteUrl") ? document.getElementById("ftRemoteUrl").value.trim() : "");
+  const pwdInp = document.getElementById("ftSshPwd");
+  const pwd = pwdInp ? pwdInp.value.trim() : "";
+  const params = [`mode=${encodeURIComponent(mode)}`];
+  if (mode === "remote" && url) params.push(`url=${encodeURIComponent(url)}`);
+  if (mode === "remote" && pwd) params.push(`ssh_password=${encodeURIComponent(pwd)}`);
+  try {
+    const r = await fetch(`/api/finetune/backend?${params.join("&")}`, { method: "POST" });
+    const j = await r.json();
+    if (!j.ok) { showError(j.error || "后端设置失败"); return; }
+    FT_BACKEND_STATE = j.data;
+    if (pwdInp) pwdInp.value = "";
+    const note = document.getElementById("ftBackendNote");
+    if (note) {
+      const sshTxt = j.data.ssh && j.data.ssh.host
+        ? `｜ SSH已配置（${j.data.ssh.user}@${j.data.ssh.host}:${j.data.ssh.port}）` : "｜ 未配SSH（远程缺数据时需填）";
+      note.textContent = mode === "remote"
+        ? (j.data.health ? `远程 ${j.data.health.gpu || ""}（${j.data.health.mem_gb}GB）在线${sshTxt}` : "远程已保存" + sshTxt)
+        : "本机 GPU 微调（评估始终本地）";
+    }
+  } catch (e) { showError("后端设置失败: " + e.message); }
+}
+
+function renderFtStatus(st) {
+  const el = document.getElementById("ftStatus");
+  if (!el || !st) return;
+  const stage = FT_STAGE_TEXT[st.stage] || st.stage;
+  let txt = `状态：${stage}`;
+  if (st.gpu_note) txt += ` ｜ ${st.gpu_note}`;
+  if (st.samples) txt += ` ｜ samples=${st.samples} epochs=${st.epochs} batch=${st.batch}`;
+  if (st.stage === "failed" && st.error) txt += ` ｜ 错误：${st.error}`;
+  el.textContent = txt;
+  // 防误触：任务运行中禁用"启动微调并评估"按钮
+  const btn = document.getElementById("ftStartBtn");
+  if (btn) {
+    if (st.running) {
+      btn.disabled = true;
+      btn.title = "任务执行中，请等待完成";
+      btn.textContent = "⏳ 任务执行中…";
+    } else {
+      btn.disabled = false;
+      btn.title = "";
+      btn.textContent = "启动微调并评估";
+    }
+  }
+  // 旧 #ftLog 已移除（替换为 #ftTerminal 终端窗口），日志统一走 refreshFtLog
+}
+
+async function startFinetune() {
+  if (!state.game || !state.video) { showError("请先选择游戏和视频"); return; }
+  // 防误触：任务运行中禁止再次启动
+  try {
+    const st = await api("/api/finetune/status");
+    if (st.running) { showError("正在执行任务，请等待完成后再启动"); return; }
+  } catch { /* 查询失败不阻塞 */ }
+  const sInp = document.getElementById("ftSamples");
+  const eInp = document.getElementById("ftEpochs");
+  const bInp = document.getElementById("ftBatch");
+  const samples = parseInt(sInp ? sInp.value : "", 10);
+  const epochs = parseInt(eInp ? eInp.value : "", 10);
+  const batchVal = bInp ? bInp.value.trim() : "";
+  if (!samples || samples < 2 || samples > 50000) { showError("样本帧数应在 2~50000 之间"); return; }
+  if (!epochs || epochs < 1 || epochs > 5) { showError("epochs 应在 1~5 之间"); return; }
+  if (batchVal) {
+    const batch = parseInt(batchVal, 10);
+    if (!batch || batch < 1 || batch > 16) { showError("batch 应在 1~16 之间（留空则自动）"); return; }
+  }
+  const params = [`game=${encodeURIComponent(state.game)}`, `video=${encodeURIComponent(state.video)}`,
+                  `samples=${samples}`, `epochs=${epochs}`];
+  if (batchVal) params.push(`batch=${batchVal}`);
+  try {
+    const r = await fetch(`/api/finetune?${params.join("&")}`, { method: "POST" });
+    const j = await r.json();
+    if (!j.ok) { showError(j.error || "微调启动失败"); return; }
+    document.getElementById("ftStatus").textContent =
+      `已启动（${j.data.gpu_note}）。samples=${j.data.samples} batch=${j.data.batch}，后台运行中…`;
+    savePrefs();   // 记住本次微调参数，下次打开面板自动恢复
+    pollFinetune();
+  } catch (e) { showError("微调启动失败: " + e.message); }
+}
+
+async function cancelFinetune() {
+  try { await fetch("/api/finetune/cancel", { method: "POST" }); }
+  catch { /* ignore */ }
+}
+
+function pollFinetune() {
+  clearInterval(window._ftTimer);
+  window._ftTimer = setInterval(async () => {
+    let st;
+    try { st = await api("/api/finetune/status"); }
+    catch { return; }
+    renderFtStatus(st);
+    refreshFtLog(st.out);   // 无条件刷新（无 out 时后端自动取/读本地日志）
+    if (!st.running) {
+      clearInterval(window._ftTimer);
+      if (st.stage === "done") {
+        refreshFtLog(st.out);
+        showFtCompare(st.samples);
+      } else if (st.stage === "failed") {
+        showError("微调失败：" + (st.error || "未知错误"));
+      }
+    }
+  }, 3000);
+}
+
+async function refreshFtLog(out) {
+  const el = document.getElementById("ftTerminal");
+  if (!el) return;
+  try {
+    const p = new URLSearchParams({ out: out || "", lines: "80" });
+    if (state.game) p.set("game", state.game);
+    if (state.video) p.set("video", state.video);
+    const d = await api(`/api/finetune/logtail?${p}`);
+    if (d.lines && d.lines.length) {
+      el.textContent = d.lines.join("\n");
+      el.scrollTop = el.scrollHeight;
+    } else if (!out) {
+      el.textContent = "（暂无日志记录，启动微调后实时显示）";
+    }
+  } catch { /* 日志拉取失败忽略 */ }
+}
+
+function clearFtLog() {
+  const el = document.getElementById("ftTerminal");
+  if (el) el.textContent = "（已清空）";
+}
+
+async function showFtCompare(samplesOverride) {
+  const sInp = document.getElementById("ftSamples");
+  const samples = samplesOverride || parseInt(sInp ? sInp.value : "", 10);
+  const box = document.getElementById("ftCompare");
+  if (!box) return;
+  if (!samples || samples < 2) { showError("请先填写样本帧数"); return; }
+  box.innerHTML = `<span class="muted">加载对照数据…</span>`;
+  try {
+    const d = await api(`/api/finetune/compare?game=${encodeURIComponent(state.game)}&video=${encodeURIComponent(state.video)}&samples=${samples}`);
+    const b = d.baseline, f = d.finetuned;
+    const fmt = v => (v == null || Number.isNaN(v)) ? "—" : v.toFixed(4);
+    const deltaTxt = d.delta.acc_17keys_all >= 0
+      ? `<span style="color:var(--green)">+${d.delta.acc_17keys_all.toFixed(4)}</span>`
+      : `<span style="color:var(--red)">${d.delta.acc_17keys_all.toFixed(4)}</span>`;
+    box.innerHTML = `
+      <table class="top5-table">
+        <thead><tr>
+          <th>模型</th><th>best shift</th><th>acc_B（逐帧全对·主口径）</th>
+          <th>acc_A（逐键逐帧）</th><th>corr_x</th><th>mse_x</th>
+        </tr></thead>
+        <tbody>
+          <tr><td>ng.pt（零样本基线）</td><td class="num">${b.shift}</td>
+              <td class="num"><b>${b.acc_17keys_all.toFixed(4)}</b></td>
+              <td class="num">${b.acc_17keys_bits.toFixed(4)}</td>
+              <td class="num">${fmt(b.corr_jl_x)}</td><td class="num">${b.mse_jl_x.toFixed(4)}</td></tr>
+          <tr><td>ng_ft_${d.samples}.pt（${d.samples} 帧微调）</td><td class="num">${f.shift}</td>
+              <td class="num"><b>${f.acc_17keys_all.toFixed(4)}</b>（Δ ${deltaTxt}）</td>
+              <td class="num">${f.acc_17keys_bits.toFixed(4)}</td>
+              <td class="num">${fmt(f.corr_jl_x)}</td><td class="num">${f.mse_jl_x.toFixed(4)}</td></tr>
+        </tbody>
+      </table>
+      ${(FT_BACKEND_STATE.mode === "remote" && d.delta.acc_17keys_all > 0)
+        ? `<p style="margin-top:8px">
+             <button class="primary-btn" onclick="pullWeight(${d.samples})">⬇ 下载该优质权重（约 2GB）</button>
+             <span id="pwStatus" class="muted" style="margin-left:8px"></span>
+           </p>`
+        : ""}
+      <p class="muted" style="margin-top:6px">${d.note}（两行均为 ${b.n_frames} 帧测试集 best shift 指标）</p>`;
+  } catch (e) {
+    box.innerHTML = `<p class="muted">暂无对照数据：${e.message}</p>`;
+  }
+}
+
+async function pullWeight(samples) {
+  const box = document.getElementById("ftCompare");
+  const params = new URLSearchParams({ game: state.game, video: state.video, samples: String(samples) });
+  try {
+    const r = await fetch(`/api/finetune/pull_weight?${params}`, { method: "POST" });
+    const j = await r.json();
+    if (!j.ok) { showError(j.error || "下载启动失败"); return; }
+    const st = document.getElementById("pwStatus");
+    if (st) st.textContent = "权重下载已启动（后台，约 10~15 分钟）";
+    pollPullWeight();
+  } catch (e) { showError("下载启动失败: " + e.message); }
+}
+
+function pollPullWeight() {
+  clearInterval(window._pwTimer);
+  window._pwTimer = setInterval(async () => {
+    let st;
+    try { st = await api("/api/finetune/pull_weight/status"); } catch { return; }
+    const el = document.getElementById("pwStatus");
+    if (!el) return;
+    if (st.done) {
+      el.textContent = `下载完成（${st.size_mb}MB）-> ${st.dest}`;
+      clearInterval(window._pwTimer);
+    } else if (st.running) {
+      el.textContent = `下载中 ${st.size_mb}MB ...`;
+    } else if (st.error) {
+      el.textContent = `下载失败：${st.error}`;
+      clearInterval(window._pwTimer);
+    }
+  }, 5000);
 }
 
 function renderSeqChart() {

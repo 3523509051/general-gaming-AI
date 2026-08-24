@@ -3,11 +3,15 @@
 # 也可手动: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\start_web.ps1
 
 $ErrorActionPreference = "Stop"
+# PS 7.3+ 默认会在原生命令（taskkill 等）返回非零退出码时抛异常，
+# 导致 finally 里 taskkill "进程不存在"时输出红字并中断清理。置 false 消除。
+$PSNativeCommandUseErrorActionPreference = $false
 $root = Split-Path -Parent $PSScriptRoot
 $py = Join-Path $root "NitroGen\.venv\Scripts\python.exe"
 $dataDir = Join-Path $root "data"
 $logOut = Join-Path $dataDir "app.log"
 $logErr = Join-Path $dataDir "app.err.log"
+$startedThisRun = $false   # 本次脚本是否实际启动了 Flask（决定 finally 是否清理）
 
 function Test-Port($port) {
     $c = New-Object System.Net.Sockets.TcpClient
@@ -18,6 +22,13 @@ function Test-Port($port) {
 
 try {
     if (-not (Test-Path $py)) { throw "venv 不存在: $py（请确认已按 README 安装 NitroGen 依赖）" }
+
+    # 0) 检测端口 5000 是否已有服务在跑：有则提示，随后按"先停旧、再启新"重启后端
+    if (Test-Port 5000) {
+        $portPid = (Get-NetTCPConnection -LocalPort 5000 -State Listen -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty OwningProcess)
+        Write-Host "检测到已有服务在运行 (PID=$portPid)，将停止并重启后端..." -ForegroundColor Yellow
+    }
 
     # 1) 停掉旧的 app.py 进程（无论 venv 还是系统 Python，命令行含 app.py 的都停）
     Write-Host "1/4 停止旧实例..." -ForegroundColor Cyan
@@ -46,6 +57,7 @@ try {
     $flaskProc = Start-Process -FilePath $py -ArgumentList "scripts\app.py" `
         -WorkingDirectory $root -WindowStyle Hidden `
         -RedirectStandardOutput $logOut -RedirectStandardError $logErr -PassThru
+    $startedThisRun = $true
 
     # 4) 等待端口 5000 就绪（最多 15s）
     Write-Host "4/4 等待端口 5000 就绪..." -ForegroundColor Cyan
@@ -77,14 +89,19 @@ catch {
     Read-Host | Out-Null
 }
 finally {
-    # 停止本脚本启动的 Flask 及其全部子进程（taskkill /T 连带杀 venv spawn 出的系统 python 子进程）
-    if ($flaskProc) {
-        taskkill /PID $flaskProc.Id /T /F 2>$null | Out-Null
-    }
-    # 释放端口 5000（兜底，防止残留进程占用）
-    $portPid = (Get-NetTCPConnection -LocalPort 5000 -State Listen -ErrorAction SilentlyContinue |
-        Select-Object -First 1 -ExpandProperty OwningProcess)
-    if ($portPid) {
-        Stop-Process -Id $portPid -Force -ErrorAction SilentlyContinue
+    # 仅当本次脚本实际启动了 Flask 才清理（避免误杀预先存在的服务实例）
+    if ($startedThisRun) {
+        # 停止本脚本启动的 Flask 及其全部子进程（taskkill /T 连带杀子进程）
+        if ($flaskProc) {
+            try { taskkill /PID $flaskProc.Id /T /F 2>$null | Out-Null } catch { }
+        }
+        # 释放端口 5000（兜底，防止残留进程占用）
+        try {
+            $portPid = (Get-NetTCPConnection -LocalPort 5000 -State Listen -ErrorAction SilentlyContinue |
+                Select-Object -First 1 -ExpandProperty OwningProcess)
+            if ($portPid) {
+                Stop-Process -Id $portPid -Force -ErrorAction SilentlyContinue
+            }
+        } catch { }
     }
 }

@@ -1183,6 +1183,9 @@ def _busy() -> str | None:
     with _eval_lock:
         if _eval_task["running"]:
             return "评估"
+    with _ft_lock:
+        if _ft_task["running"]:
+            return "微调"
     with _rescan_lock:
         if _rescan_proc is not None and _rescan_proc.poll() is None:
             return "探测链接"
@@ -1281,6 +1284,774 @@ def api_evaluate_cancel():
         d = dict(_eval_task)
         d.pop("proc", None)
     return ok(d)
+
+
+# --------------------------------------------------------------------------
+# API 11: 微调自动化对照闭环（扩展 A：finetune.py + evaluate.py --ckpt 串联）
+# 任务链：补零样本基线副本（如缺）→ 微调 → 微调权重评估 → compare 接口取对照
+# --------------------------------------------------------------------------
+_ft_task = {"running": False, "game": None, "video": None, "stage": "idle",
+            "samples": None, "epochs": None, "batch": None, "gpu_note": "",
+            "backend": "local", "remote_url": "", "out": None,
+            "log_tail": "", "error": None, "started_at": None, "proc": None}
+_ft_lock = threading.Lock()
+
+# 微调后端：local=本机 GPU，remote=<http://host:port>=远程 A100 worker
+# 通过 /api/finetune/backend 运行时切换；初始为空，GET 时读持久化配置
+# ssh 字段（host/port/user/password）仅用于缺数据时自动上传，存 data/remote_worker.json（不入库）
+FT_BACKEND = {"mode": "", "remote_url": "", "ssh": {}}
+FT_REMOTE_CONFIG = Path(os.environ.get("FT_REMOTE_CONFIG", str(REPO / "data" / "remote_worker.json")))
+
+
+def _load_remote_config() -> dict:
+    """读远程 worker 配置（含 ssh 凭据），失败返回 {}。"""
+    try:
+        if FT_REMOTE_CONFIG.exists():
+            return json.load(open(FT_REMOTE_CONFIG, encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+def _ensure_backend_loaded():
+    """确保 FT_BACKEND 已从持久化配置恢复（Web 重启后内存态为空时）。"""
+    if not FT_BACKEND["mode"] and not FT_BACKEND["remote_url"]:
+        cfg = _load_remote_config()
+        if cfg.get("url"):
+            FT_BACKEND["mode"] = "remote"
+            FT_BACKEND["remote_url"] = cfg["url"]
+            FT_BACKEND["ssh"] = cfg.get("ssh") or {}
+
+
+def remote_worker_health(url: str) -> dict | None:
+    """探测远程 worker /health，失败返回 None。"""
+    try:
+        import urllib.request
+        with urllib.request.urlopen(url + "/health", timeout=5) as r:
+            return json.load(r).get("data")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def remote_worker_status(url: str) -> dict | None:
+    """查远程 worker /status，失败返回 None。"""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url + "/status", timeout=10) as r:
+            return json.load(r).get("data", {})
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _poll_remote_until_done(url: str, game: str, video: str, samples: int,
+                            log_fn) -> dict:
+    """轮询远程任务到结束，返回最终 status dict（期间日志打到 log_fn）。"""
+    import urllib.request
+    st = {}
+    while True:
+        try:
+            with urllib.request.urlopen(url + "/status", timeout=10) as r:
+                st = json.load(r).get("data", {})
+            tail = st.get("log_tail") or ""
+            if tail:
+                last = tail.splitlines()[-1]
+                if last and not last.startswith("["):
+                    log_fn(f"[remote] {last}")
+        except Exception as e:  # noqa: BLE001
+            log_fn(f"[remote] status 轮询异常: {e}")
+        if not st.get("running"):
+            return st
+        if st.get("stage") == "failed":
+            raise RuntimeError(f"远程微调失败: {st.get('error')}")
+        time.sleep(10)
+
+
+def remote_start(url: str, params: dict) -> tuple[int, dict | str]:
+    """调远程 worker /start，返回 (status_code, data或error)。"""
+    import urllib.parse
+    import urllib.request
+    qs = urllib.parse.urlencode(params)
+    try:
+        req = urllib.request.Request(url + "/start?" + qs, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, json.load(r)
+    except Exception as e:  # noqa: BLE001
+        return 500, str(e)
+
+
+def remote_fetch_weight(url: str, out: str, dest: Path, log_fn=None) -> None:
+    """从远程 worker /download 分块拉微调权重到本地 dest（避免大文件整读挂起）。"""
+    import urllib.parse
+    import urllib.request
+    qs = urllib.parse.urlencode({"out": out})
+    with urllib.request.urlopen(f"{url}/download?{qs}", timeout=3600) as r:
+        total = 0
+        with open(dest, "wb") as f:
+            while True:
+                chunk = r.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                total += len(chunk)
+                if log_fn and total % (200 * 1024 * 1024) == 0:
+                    log_fn(f"已下载 {total / 1024 / 1024:.0f} MB")
+        if log_fn:
+            log_fn(f"权重下载完成（{total / 1024 / 1024:.0f} MB）")
+
+
+def remote_fetch_csv(url: str, game: str, video: str, samples: int,
+                     dest_dir: Path, log_fn=None) -> str:
+    """从远程 worker 拉评估 CSV（metrics + predictions）回本地（KB 级，替代 2GB 权重回传）。"""
+    import urllib.parse
+    import urllib.request
+    tag = f"ng_ft_{samples}"
+    qs = urllib.parse.urlencode({"game": game, "video": video, "samples": samples})
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(f"{url}/metrics_csv?{qs}", timeout=120) as r:
+        (dest_dir / f"metrics_{video}_{tag}.csv").write_text(
+            r.read().decode("utf-8"), encoding="utf-8")
+    if log_fn:
+        log_fn(f"metrics_{video}_{tag}.csv 已回传")
+    try:
+        with urllib.request.urlopen(f"{url}/predictions_csv?{qs}", timeout=300) as r:
+            (dest_dir / f"predictions_{video}_{tag}.csv").write_text(
+                r.read().decode("utf-8"), encoding="utf-8")
+        if log_fn:
+            log_fn(f"predictions_{video}_{tag}.csv 已回传")
+    except Exception as e:  # noqa: BLE001
+        if log_fn:
+            log_fn(f"predictions 拉取失败（可选，不影响对照）: {e}")
+    return tag
+
+
+def remote_data_check(url: str, game: str, video: str) -> list[str]:
+    """调远程 worker /data_check，返回缺失数据列表（空=齐备）。失败按全缺失处理。"""
+    import urllib.parse
+    import urllib.request
+    qs = urllib.parse.urlencode({"game": game, "video": video})
+    try:
+        with urllib.request.urlopen(f"{url}/data_check?{qs}", timeout=10) as r:
+            d = json.load(r).get("data", {})
+            return d.get("missing", [])
+    except Exception:  # noqa: BLE001
+        return ["video", "manifest", "annotations"]
+
+
+def remote_upload_data(ssh_cfg: dict, game: str, video: str, log_fn=None) -> int:
+    """SFTP 自动上传该游戏数据（视频+manifest+annotations）到远程，返回总字节数。"""
+    import paramiko
+    host = ssh_cfg.get("host")
+    port = int(ssh_cfg.get("port", 22))
+    user = ssh_cfg.get("user", "root")
+    pwd = ssh_cfg.get("password", "")
+    if not host or not pwd:
+        raise RuntimeError("SSH 配置不完整（host/password），请在后端设置中填写")
+    remote_base = "/root/workspace/nitrogen_worker"
+    srcs = [
+        (DATA_ROOT / "videos" / f"{game}_{video}.mp4", f"{remote_base}/data/videos/{game}_{video}.mp4"),
+        (DATA_ROOT / game / "manifest.json", f"{remote_base}/data/{game}/manifest.json"),
+        (DATA_ROOT / game / "annotations.parquet", f"{remote_base}/data/{game}/annotations.parquet"),
+    ]
+    missing = [p.name for p, _ in srcs if not p.exists()]
+    if missing:
+        raise RuntimeError(f"本地数据缺失，无法上传: {missing}")
+    c = paramiko.SSHClient()
+    c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    c.connect(host, port=port, username=user, password=pwd, timeout=15)
+    c.exec_command(f"mkdir -p {remote_base}/data/videos {remote_base}/data/{game}")
+    time.sleep(0.5)
+    sftp = c.open_sftp()
+    total = 0
+    for p, remote in srcs:
+        mb = p.stat().st_size / 1024 / 1024
+        if log_fn:
+            log_fn(f"上传 {p.name}（{mb:.0f} MB）...")
+        sftp.put(str(p), remote)
+        total += p.stat().st_size
+    sftp.close()
+    c.close()
+    return total
+
+
+def auto_batch_size(remote_url: str = "") -> tuple[int, str]:
+    """按后端显存自动选微调 batch；remote 优先用 worker /health 的显存。"""
+    if remote_url:
+        h = remote_worker_health(remote_url)
+        if h and h.get("mem_gb"):
+            mem = h["mem_gb"]
+            if mem < 6:
+                b = 1
+            elif mem < 8:
+                b = 2
+            elif mem < 16:
+                b = 4
+            else:
+                b = 8
+            return b, f"{h.get('gpu','远程GPU')}（{mem:.1f} GB）→ 自动 batch={b}"
+    try:
+        import torch
+        if torch.cuda.is_available():
+            mem = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+            name = torch.cuda.get_device_name(0)
+            if mem < 6:
+                b = 1
+            elif mem < 8:
+                b = 2
+            elif mem < 16:
+                b = 4
+            else:
+                b = 8
+            return b, f"{name}（{mem:.1f} GB）→ 自动 batch={b}"
+    except Exception:  # noqa: BLE001
+        pass
+    return 2, "未检测到 GPU，保守使用 batch=2（训练可能很慢）"
+    try:
+        import torch
+        if torch.cuda.is_available():
+            mem = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+            name = torch.cuda.get_device_name(0)
+            if mem < 6:
+                b = 1
+            elif mem < 8:
+                b = 2
+            elif mem < 16:
+                b = 4
+            else:
+                b = 8
+            return b, f"{name}（{mem:.1f} GB）→ 自动 batch={b}"
+    except Exception:  # noqa: BLE001
+        pass
+    return 2, "未检测到 GPU，保守使用 batch=2（训练可能很慢）"
+
+
+def _ft_stage(cmd: list[str], log: Path) -> int:
+    """跑任务链中的一个子阶段（追加写同一日志），记录 proc 供取消。"""
+    proc = subprocess.Popen(cmd, cwd=str(REPO),
+                            stdout=open(log, "a", encoding="utf-8"),
+                            stderr=subprocess.STDOUT)
+    with _ft_lock:
+        _ft_task["proc"] = proc
+    return proc.wait()
+
+
+def _run_finetune_chain(game: str, video: str, fps: int,
+                        samples: int, epochs: int, batch: int,
+                        backend: str = "local", remote_url: str = ""):
+    tag = f"ng_ft_{samples}"
+    ckpt_rel = f"NitroGen/{tag}.pt"
+    log = DATA_ROOT / f"finetune_{game}_{video}.log"
+    with open(log, "w", encoding="utf-8") as f:
+        f.write(f"[chain] game={game} video={video} samples={samples} "
+                f"epochs={epochs} batch={batch} backend={backend} out={ckpt_rel}\n")
+
+    def _log(msg: str):
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+
+    try:
+        # 阶段 0：零样本基线副本缺失则先补（一次约 2 分钟，之后复用）
+        if not (DATA_ROOT / game / "eval" / f"metrics_{video}_ng.csv").exists():
+            with _ft_lock:
+                _ft_task.update(stage="baseline")
+            _log("=== 阶段 0/2：补零样本基线副本（--tag ng） ===")
+            rc = _ft_stage([sys.executable, str(REPO / "scripts" / "evaluate.py"),
+                            "--game", game, "--video", video, "--fps", str(fps),
+                            "--tag", "ng"], log)
+            if rc != 0:
+                raise RuntimeError(f"基线评估失败（退出码 {rc}），日志: data/finetune_{game}_{video}.log")
+
+        # 阶段 1：微调（按后端分发）
+        with _ft_lock:
+            _ft_task.update(stage="finetuning")
+        if backend == "remote":
+            # 阶段 0.5：数据检查 + 自动上传（远程缺视频/标注时，仅首次慢）
+            _ensure_backend_loaded()
+            _log("=== 检查远程数据 ===")
+            missing = remote_data_check(remote_url, game, video)
+            if missing:
+                with _ft_lock:
+                    _ft_task.update(stage="uploading")
+                _log(f"远程缺失数据: {missing}，开始自动上传 ...")
+                ssh_cfg = FT_BACKEND.get("ssh") or {}
+                if not ssh_cfg.get("password"):
+                    raise RuntimeError("远程缺数据且未配置 SSH 凭据（后端设置里填 SSH 密码后重试）")
+                remote_upload_data(ssh_cfg, game, video, log_fn=_log)
+                _log("数据上传完成")
+                with _ft_lock:
+                    _ft_task.update(stage="finetuning")
+            else:
+                _log("远程数据齐备，跳过上传")
+            _log(f"=== 阶段 1/2：远程微调+评估（{remote_url}，samples={samples} epochs={epochs} batch={batch}） ===")
+            out_name = f"{tag}.pt"
+            code, resp = remote_start(remote_url, {
+                "game": game, "video": video, "samples": samples,
+                "epochs": epochs, "batch": batch, "out": out_name})
+            if code != 202:
+                raise RuntimeError(f"远程微调启动失败（{code}）: {resp}")
+            # 轮询远程状态直到完成（复用函数，供 recover 接管）
+            st = _poll_remote_until_done(remote_url, game, video, samples, _log)
+            if st.get("stage") != "done":
+                raise RuntimeError(f"远程微调未成功完成: {st.get('stage')} / {st.get('error')}")
+            # 回传评估 CSV（KB 级，权重留远程按需下载）
+            _log("=== 拉取远程评估结果 CSV 回本地 ===")
+            remote_fetch_csv(remote_url, game, video, samples,
+                             DATA_ROOT / game / "eval", log_fn=_log)
+            _log(f"对照数据就绪（权重留远程：output/{out_name}，可在面板按需下载）")
+        else:
+            _log(f"=== 阶段 1/2：本机微调（samples={samples} epochs={epochs} batch={batch}） ===")
+            rc = _ft_stage([sys.executable, str(REPO / "scripts" / "finetune.py"),
+                            "--game", game, "--video", video, "--fps", str(fps),
+                            "--samples", str(samples), "--epochs", str(epochs),
+                            "--batch", str(batch), "--out", ckpt_rel], log)
+            if rc != 0:
+                raise RuntimeError(f"微调失败（退出码 {rc}），日志: data/finetune_{game}_{video}.log")
+            # 阶段 2：本机微调权重评估（remote 后端评估已在远程完成，只回传 CSV）
+            with _ft_lock:
+                _ft_task.update(stage="evaluating")
+            _log(f"=== 阶段 2/2：本机微调权重评估（--ckpt {ckpt_rel} --tag {tag}） ===")
+            rc = _ft_stage([sys.executable, str(REPO / "scripts" / "evaluate.py"),
+                            "--game", game, "--video", video, "--fps", str(fps),
+                            "--ckpt", ckpt_rel, "--tag", tag], log)
+            if rc != 0:
+                raise RuntimeError(f"微调权重评估失败（退出码 {rc}），日志: data/finetune_{game}_{video}.log")
+
+        clear_cache(game)
+        with _ft_lock:
+            _ft_task.update(running=False, stage="done", proc=None)
+    except Exception as e:  # noqa: BLE001
+        with _ft_lock:
+            _ft_task.update(running=False, stage="failed", proc=None, error=str(e)[:300])
+
+
+@app.post("/api/finetune")
+def api_finetune():
+    game = request.args.get("game", "").strip()
+    video = request.args.get("video", "").strip()
+    if not game or not video:
+        return err("参数 game/video 必填")
+    samples_raw = request.args.get("samples", "").strip()
+    try:
+        samples = int(samples_raw) if samples_raw else 1000
+        if samples < 2 or samples > 50000:
+            return err("samples 应在 2~50000 之间")
+    except ValueError:
+        return err("samples 必须是整数")
+    epochs_raw = request.args.get("epochs", "").strip()
+    try:
+        epochs = int(epochs_raw) if epochs_raw else 1
+        if epochs < 1 or epochs > 5:
+            return err("epochs 应在 1~5 之间")
+    except ValueError:
+        return err("epochs 必须是整数")
+    _ensure_backend_loaded()
+    batch_raw = request.args.get("batch", "").strip()
+    # 后端：显式 > 全局 FT_BACKEND
+    backend = FT_BACKEND["mode"]
+    remote_url = FT_BACKEND["remote_url"] if backend == "remote" else ""
+    if batch_raw:
+        try:
+            batch = int(batch_raw)
+            if batch < 1 or batch > 16:
+                return err("batch 应在 1~16 之间")
+            gpu_note = f"手动指定 batch={batch}"
+        except ValueError:
+            return err("batch 必须是整数")
+    else:
+        batch, gpu_note = auto_batch_size(remote_url)
+
+    assert_lineage(game, video)
+    if backend == "remote":
+        # 远程后端：本地必须有视频供评估用；微调样本源在远程，但本地也需视频+标注评估
+        if not (DATA_ROOT / "videos" / f"{game}_{video}.mp4").exists():
+            return err("该视频未下载，评估需要本地视频文件。请先下载。", 400)
+        if not remote_url:
+            return err("远程后端未配置地址（先设置 backend）", 400)
+        if remote_worker_health(remote_url) is None:
+            return err(f"远程 worker 不可达: {remote_url}", 400)
+    else:
+        if not (DATA_ROOT / "videos" / f"{game}_{video}.mp4").exists():
+            return err("该视频未下载，微调需要本地视频文件。请先下载。", 400)
+    fps = _fps_from_manifest(game, video)
+    if fps is None:
+        return err("无法自动推导 fps（manifest 中无该视频的 chunk 行数）", 400)
+
+    busy = _busy()
+    if busy:
+        return err(f"有任务正在运行（{busy}），请稍后再试", 409)
+    with _ft_lock:
+        if _ft_task["running"]:
+            return err("已有微调任务在运行，请稍候", 409)
+        _ft_task.update(running=True, game=game, video=video, stage="finetuning",
+                        samples=samples, epochs=epochs, batch=batch, gpu_note=gpu_note,
+                        backend=backend, remote_url=remote_url, out=f"ng_ft_{samples}.pt",
+                        log_tail="", error=None,
+                        started_at=time.strftime("%H:%M:%S"), proc=None)
+    threading.Thread(target=_run_finetune_chain,
+                     args=(game, video, fps, samples, epochs, batch, backend, remote_url),
+                     daemon=True).start()
+    return jsonify({"ok": True, "data": {"status": "started", "game": game,
+                                         "video": video, "fps": fps, "samples": samples,
+                                         "epochs": epochs, "batch": batch,
+                                         "backend": backend, "remote_url": remote_url,
+                                         "gpu_note": gpu_note}}), 202
+
+
+@app.post("/api/finetune/backend")
+def api_finetune_backend_set():
+    """设置微调后端：?mode=local 或 ?mode=remote&url=http://host:port
+    SSH 参数（ssh_port/ssh_user/ssh_password）仅缺数据自动上传时用，存本地不入库。"""
+    mode = request.args.get("mode", "").strip()
+    if mode not in ("local", "remote"):
+        return err("mode 应为 local 或 remote")
+    url = request.args.get("url", "").strip()
+    if mode == "remote":
+        if not url:
+            return err("remote 模式需要 url（如 http://10.14.3.52:56272）")
+        if not url.startswith("http://") and not url.startswith("https://"):
+            url = "http://" + url
+        url = url.rstrip("/")
+        if remote_worker_health(url) is None:
+            return err(f"远程 worker 不可达: {url}", 400)
+    else:
+        url = ""
+    # SSH 配置：新填则更新；未填保留原值
+    ssh = dict(FT_BACKEND.get("ssh") or {})
+    if mode == "remote":
+        for key, arg in (("host", "ssh_host"), ("port", "ssh_port"),
+                         ("user", "ssh_user"), ("password", "ssh_password")):
+            v = request.args.get(arg, "").strip()
+            if v:
+                ssh[key] = v
+        if not ssh.get("host"):
+            # 默认从 url 推导 host
+            host = url.split("://")[1].split(":")[0] if "://" in url else url.split(":")[0]
+            ssh.setdefault("host", host)
+        ssh.setdefault("port", "56271")
+        ssh.setdefault("user", "root")
+    FT_BACKEND["mode"] = mode
+    FT_BACKEND["remote_url"] = url
+    FT_BACKEND["ssh"] = ssh if mode == "remote" else {}
+    # 持久化（password 仅存 data/remote_worker.json，不入库）
+    try:
+        FT_REMOTE_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        json.dump({"mode": mode, "url": url, "ssh": ssh if mode == "remote" else {}},
+                  open(FT_REMOTE_CONFIG, "w", encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        pass
+    # 返回时隐藏 password
+    safe = {k: v for k, v in ssh.items() if k != "password"}
+    return ok({"mode": mode, "remote_url": url, "ssh": safe,
+               "health": remote_worker_health(url)})
+
+
+@app.get("/api/finetune/backend")
+def api_finetune_backend_get():
+    """查询当前微调后端；未显式设置时尝试读持久化配置，否则默认 local。"""
+    _ensure_backend_loaded()
+    health = None
+    if FT_BACKEND["mode"] == "remote" and FT_BACKEND["remote_url"]:
+        health = remote_worker_health(FT_BACKEND["remote_url"])
+    ssh_safe = {k: v for k, v in (FT_BACKEND.get("ssh") or {}).items() if k != "password"}
+    return ok({
+        "mode": FT_BACKEND["mode"],
+        "remote_url": FT_BACKEND["remote_url"],
+        "ssh": ssh_safe,
+        "health": health,
+        "available_backends": ["local", "remote"],
+    })
+
+
+@app.get("/api/finetune/status")
+def api_finetune_status():
+    with _ft_lock:
+        t = {k: v for k, v in _ft_task.items()}
+    t.pop("proc", None)
+    if t.get("game"):
+        log = DATA_ROOT / f"finetune_{t['game']}_{t['video']}.log"
+        if log.exists():
+            try:
+                lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+                t["log_tail"] = "\n".join(lines[-8:])
+            except OSError:
+                pass
+    return ok(t)
+
+
+@app.post("/api/finetune/cancel")
+def api_finetune_cancel():
+    with _ft_lock:
+        if _ft_task["running"] and _ft_task["proc"]:
+            try:
+                _ft_task["proc"].terminate()
+            except Exception:  # noqa: BLE001
+                pass
+        d = dict(_ft_task)
+        d.pop("proc", None)
+    return ok(d)
+
+
+@app.get("/api/finetune/compare")
+def api_finetune_compare():
+    """零样本基线 vs 微调权重对照（读两份 metrics 副本的 best shift 行）。"""
+    game = request.args.get("game", "").strip()
+    video = request.args.get("video", "").strip()
+    samples_raw = request.args.get("samples", "").strip()
+    if not game or not video or not samples_raw:
+        return err("参数 game/video/samples 必填")
+    try:
+        samples = int(samples_raw)
+    except ValueError:
+        return err("samples 必须是整数")
+    tag = f"ng_ft_{samples}"
+
+    def best_row(p: Path) -> dict | None:
+        if not p.exists():
+            return None
+        rows = list(csv.DictReader(open(p, encoding="utf-8")))
+        if not rows:
+            return None
+        r = max(rows, key=lambda m: float(m["acc_17keys_all"]))
+        return {
+            "shift": int(r["shift"]),
+            "acc_17keys_all": round(float(r["acc_17keys_all"]), 4),   # B 口径（主）
+            "acc_17keys_bits": round(float(r["acc_17keys_bits"]), 4),  # A 口径（对照）
+            "corr_jl_x": float(r["corr_jl_x"]) if r["corr_jl_x"] not in ("nan", "") else None,
+            "mse_jl_x": round(float(r["mse_jl_x"]), 4),
+            "n_frames": int(r["n_frames"]),
+        }
+
+    base = best_row(DATA_ROOT / game / "eval" / f"metrics_{video}_ng.csv")
+    ft = best_row(DATA_ROOT / game / "eval" / f"metrics_{video}_{tag}.csv")
+    if base is None:
+        return err(f"缺少零样本基线副本 metrics_{video}_ng.csv（先跑一次微调链或评估）", 404)
+    if ft is None:
+        return err(f"缺少微调副本 metrics_{video}_{tag}.csv（samples={samples} 的微调尚未完成）", 404)
+    return ok({
+        "game": game, "video": video, "samples": samples,
+        "baseline": base, "finetuned": ft,
+        "delta": {
+            "acc_17keys_all": round(ft["acc_17keys_all"] - base["acc_17keys_all"], 4),
+            "acc_17keys_bits": round(ft["acc_17keys_bits"] - base["acc_17keys_bits"], 4),
+        },
+        "note": "论文口径为任务完成率（微调 +10%~52% 相对提升）；本表为离线口径"
+                "（按键一致率 B/摇杆相关），两者不等价，差异小属正常。",
+    })
+
+
+# ---- 恢复接管：本地关闭期间远程任务照跑，重开 Web 后自动接管/拉回 ----
+@app.get("/api/finetune/recover")
+def api_finetune_recover():
+    _ensure_backend_loaded()
+    if FT_BACKEND["mode"] != "remote" or not FT_BACKEND["remote_url"]:
+        return ok({"status": "idle", "reason": "非远程后端"})
+    url = FT_BACKEND["remote_url"]
+    st = remote_worker_status(url)
+    if st is None:
+        return ok({"status": "idle", "reason": "远程 worker 不可达"})
+    with _ft_lock:
+        if _ft_task["running"]:
+            return ok({"status": "busy", "reason": "本地已有任务在运行"})
+    if st.get("running"):
+        game, video = st.get("game"), st.get("video")
+        try:
+            samples_i = int(st.get("samples"))
+        except (TypeError, ValueError):
+            return ok({"status": "idle", "reason": "远程任务参数不完整"})
+        if not game or not video:
+            return ok({"status": "idle", "reason": "远程任务参数不完整"})
+        tag = f"ng_ft_{samples_i}"
+        log = DATA_ROOT / f"finetune_{game}_{video}.log"
+        with open(log, "w", encoding="utf-8") as f:
+            f.write(f"[recover] 接管远程任务 game={game} video={video} samples={samples_i}\n")
+
+        def _log(m: str):
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(m + "\n")
+
+        with _ft_lock:
+            _ft_task.update(running=True, game=game, video=video, samples=samples_i,
+                            epochs=st.get("epochs"), batch=st.get("batch"),
+                            stage=st.get("stage") or "finetuning", backend="remote",
+                            remote_url=url, out=st.get("out"), gpu_note="恢复远程任务",
+                            error=None, started_at=st.get("started_at"), proc=None)
+        threading.Thread(target=_recover_poll,
+                         args=(url, game, video, samples_i, tag, log), daemon=True).start()
+        return ok({"status": "adopted", "stage": st.get("stage"), "samples": samples_i,
+                   "note": "已接管远程运行中的任务"})
+    if st.get("stage") == "done":
+        game, video = st.get("game"), st.get("video")
+        try:
+            samples_i = int(st.get("samples"))
+        except (TypeError, ValueError):
+            samples_i = None
+        if game and video and samples_i:
+            eval_dir = DATA_ROOT / game / "eval"
+            tag = f"ng_ft_{samples_i}"
+            if not (eval_dir / f"metrics_{video}_{tag}.csv").exists():
+                remote_fetch_csv(url, game, video, samples_i, eval_dir)
+                clear_cache(game)
+                return ok({"status": "recovered", "samples": samples_i,
+                           "note": "已拉取远程完成任务的评估结果"})
+            return ok({"status": "already", "samples": samples_i,
+                       "note": "本地已有该任务的对照数据"})
+    return ok({"status": "idle", "reason": f"远程无运行中任务（stage={st.get('stage')}）"})
+
+
+def _recover_poll(url: str, game: str, video: str, samples: int, tag: str, log: Path):
+    """接管线程：轮询远程到 done → 拉 CSV → 更新本地状态。"""
+    def _log(m: str):
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(m + "\n")
+    try:
+        st = _poll_remote_until_done(url, game, video, samples, _log)
+        if st.get("stage") != "done":
+            raise RuntimeError(f"远程未成功完成: {st.get('stage')} / {st.get('error')}")
+        _log("=== 拉取远程评估结果 CSV 回本地 ===")
+        remote_fetch_csv(url, game, video, samples, DATA_ROOT / game / "eval", log_fn=_log)
+        clear_cache(game)
+        with _ft_lock:
+            _ft_task.update(running=False, stage="done", proc=None)
+    except Exception as e:  # noqa: BLE001
+        with _ft_lock:
+            _ft_task.update(running=False, stage="failed", proc=None, error=str(e)[:300])
+
+
+# ---- 实时日志终端（前端可视化命令窗口） ----
+@app.get("/api/finetune/logtail")
+def api_finetune_logtail():
+    _ensure_backend_loaded()
+    out = request.args.get("out", "").strip()
+    try:
+        lines = min(max(int(request.args.get("lines", "60")), 1), 300)
+    except ValueError:
+        lines = 60
+    if FT_BACKEND["mode"] == "remote" and FT_BACKEND["remote_url"]:
+        import urllib.parse
+        import urllib.request
+        if not out:
+            # 无 out：自动取 worker 上次任务的 out（非 running 时也保留），显示历史日志
+            st = remote_worker_status(FT_BACKEND["remote_url"])
+            if st and st.get("out"):
+                out = st["out"]
+        qs = urllib.parse.urlencode({"out": out, "lines": lines})
+        try:
+            with urllib.request.urlopen(f"{FT_BACKEND['remote_url']}/logtail?{qs}", timeout=10) as r:
+                return ok(json.load(r).get("data", {}))
+        except Exception as e:  # noqa: BLE001
+            return err(f"远程日志拉取失败: {e}")
+    # local：读本地 finetune 日志
+    game = request.args.get("game", "").strip()
+    video = request.args.get("video", "").strip()
+    p = DATA_ROOT / f"finetune_{game}_{video}.log"
+    if not p.exists():
+        return ok({"lines": []})
+    lines_list = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    return ok({"lines": lines_list[-lines:]})
+
+
+# ---- 按需下载远程微调权重（只拉优质权重，2GB 异步后台） ----
+_pw_task = {"running": False, "done": False, "error": None, "dest": None,
+            "samples": None, "started_at": None}
+_pw_lock = threading.Lock()
+
+
+@app.post("/api/finetune/pull_weight")
+def api_finetune_pull_weight():
+    game = request.args.get("game", "").strip()
+    video = request.args.get("video", "").strip()
+    samples_raw = request.args.get("samples", "").strip()
+    try:
+        samples = int(samples_raw)
+    except ValueError:
+        return err("samples 必须是整数")
+    _ensure_backend_loaded()
+    if FT_BACKEND["mode"] != "remote" or not FT_BACKEND["remote_url"]:
+        return err("当前不是远程后端，无需拉取远程权重", 400)
+    url = FT_BACKEND["remote_url"]
+    if remote_worker_health(url) is None:
+        return err(f"远程 worker 不可达: {url}", 400)
+    tag = f"ng_ft_{samples}"
+    dest = REPO / "NitroGen" / f"{tag}.pt"
+    if dest.exists():
+        return ok({"dest": str(dest), "note": "权重已存在本地"})
+    with _pw_lock:
+        if _pw_task["running"]:
+            return err("已有权重下载任务在运行", 409)
+        _pw_task.update(running=True, done=False, error=None,
+                        dest=str(dest), samples=samples,
+                        started_at=time.strftime("%H:%M:%S"))
+    threading.Thread(target=_pull_weight_worker,
+                     args=(url, f"{tag}.pt", dest), daemon=True).start()
+    return jsonify({"ok": True, "data": {"status": "started", "dest": str(dest),
+                                         "note": "约需 10~15 分钟，后台异步不阻塞"}}), 202
+
+
+def _pull_weight_worker(url: str, out: str, dest: Path):
+    try:
+        remote_fetch_weight(url, out, dest)
+        with _pw_lock:
+            _pw_task.update(running=False, done=True, error=None)
+    except Exception as e:  # noqa: BLE001
+        with _pw_lock:
+            _pw_task.update(running=False, done=False, error=str(e)[:200])
+        if dest.exists():
+            try:
+                dest.unlink()  # 删除半成品
+            except OSError:
+                pass
+
+
+@app.get("/api/finetune/pull_weight/status")
+def api_finetune_pull_weight_status():
+    with _pw_lock:
+        d = dict(_pw_task)
+    if d.get("dest"):
+        p = Path(d["dest"])
+        d["size_mb"] = round(p.stat().st_size / 1024 / 1024, 1) if p.exists() else 0
+    return ok(d)
+
+
+# ---- 界面偏好：保存/恢复上次关闭时选择的游戏和视频（data/web_prefs.json，不入库） ----
+PREFS_PATH = DATA_ROOT / "web_prefs.json"
+
+
+@app.get("/api/prefs")
+def api_prefs_get():
+    try:
+        if PREFS_PATH.exists():
+            return ok(json.load(open(PREFS_PATH, encoding="utf-8")))
+    except Exception:  # noqa: BLE001
+        pass
+    return ok({})
+
+
+@app.post("/api/prefs")
+def api_prefs_set():
+    game = request.args.get("game", "").strip()
+    video = request.args.get("video", "").strip()
+    # 字段级合并：未提供的字段保留（避免 onVideoChange 只传 game/video 时清掉微调参数）
+    try:
+        prefs = json.load(open(PREFS_PATH, encoding="utf-8")) if PREFS_PATH.exists() else {}
+    except Exception:  # noqa: BLE001
+        prefs = {}
+    if game:
+        prefs["game"] = game
+    if video:
+        prefs["video"] = video
+    for k in ("samples", "epochs", "batch"):
+        if k in request.args:
+            v = request.args.get(k, "").strip()
+            if v:
+                prefs[k] = v
+            else:
+                prefs.pop(k, None)   # 显式传空 → 清除该字段（batch 留空=自动）
+    prefs["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        json.dump(prefs, open(PREFS_PATH, "w", encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        pass
+    return ok(prefs)
 
 
 # --------------------------------------------------------------------------

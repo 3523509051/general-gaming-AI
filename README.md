@@ -24,7 +24,7 @@
 | 1 | 跑通官方 ng.pt 推理，README 可复现 | ✅ 环境就绪，冒烟测试通过 |
 | 2 | 同一游戏标注 ≥ 500 帧：按键/摇杆分布统计 + ≥ 10 条序列可视化 | ✅ Hades（53.8 万帧）/ lies_of_p / star_fox_64 已提取并出图 |
 | 3 | 测试集（默认 200 帧，前端可调 10~5000）：按键一致率、摇杆 MSE / 相关系数 | ✅ hades / lies_of_p 已评估（B 口径，纯随机抽样，指标见指标条） |
-| 4 | zero-shot 基线对比 | ✅ 已对比（按键达标 ~0.5，摇杆相关 ~0 未达 0.4，分析见项目备忘） |
+| 4 | zero-shot 基线对比 | ✅ 已对比（按键达标 ~0.5，摇杆相关 ~0 未达 0.4，分析见项目备忘）；并实现扩展 A 小样本微调对照（本机/远程双后端，见下文） |
 | 5 | 第 5 天演示：模型输出 vs 标注对比 | 🔶 前后端 Web 平台已完成，待演示走查 |
 | 6 | 归档代码与指标表，实验说明写入结课大报告 | 待做 |
 
@@ -41,7 +41,9 @@ general-gaming-AI/
 │   ├── app.py            # Flask 后端（Web 平台，10+ 接口）
 │   ├── scan_shard.py     # 一键识别切片：游戏/视频/链接清单（--merge 合并多切片）
 │   ├── extract_game.py   # 通用标注提取（--game/--video/--limit/--shard，自动发现全部切片）
-│   ├── evaluate.py       # 通用 zero-shot 评估（建测试集/推理/shift 扫描/写库）
+│   ├── evaluate.py       # 通用 zero-shot 评估（建测试集/推理/shift 扫描/写库；--ckpt 可评估微调权重）
+│   ├── finetune.py       # 单游戏小样本微调（行为克隆，输出 ng_ft_<N>.pt，供 --ckpt 评估）
+│   ├── gpu_worker.py     # 远程 GPU Worker（部署到 A100，HTTP 接口跑微调+评估，CSV 回传本地）
 │   ├── stats_viz.py      # 统计可视化（按键/摇杆分布/10 条序列，中文）
 │   ├── plot_shift_scan.py      # shift 扫描曲线（中文，含双摇杆）
 │   ├── init_db.py        # 建 eval_results.db 结果库 + 种子数据
@@ -227,11 +229,41 @@ NitroGen\.venv\Scripts\python.exe scripts\extract_game.py --game <game>
 # 默认 200 帧纯随机抽样（B 口径）；复用旧测试集时帧数不符会自动重建
 NitroGen\.venv\Scripts\python.exe scripts\evaluate.py --game <game> --video <video> --fps <fps>
 # 可选：--test-size 200（帧数，默认 200，Web 端指标条可调） / --sample-mode random|stratified / --seq-mode（连续片段序列集）
+#       --ckpt <权重>  评估微调权重（默认 ng.pt；如 NitroGen/ng_ft_1000.pt）
+#       --tag <标签>   额外写 metrics/predictions 带标签副本（供零样本 vs 微调对照）
+#       --no-plots     跳过统计图生成（远程 worker 评估用）
 
 # 统计图 / shift 扫描图（matplotlib，中文）
 NitroGen\.venv\Scripts\python.exe scripts\stats_viz.py --game <game>
 NitroGen\.venv\Scripts\python.exe scripts\plot_shift_scan.py --game <game> --video <video>
 ```
+
+## 扩展 A：小样本微调 + 零样本对照（可选，需 NVIDIA GPU）
+
+**做什么**：在官方 ng.pt 基础上，用该游戏若干标注帧做一轮行为克隆微调（flow-matching loss，视觉编码器冻结），再用 `evaluate.py --ckpt` 评估微调权重，与零样本基线逐指标对照（按键一致率 B 口径 / A 口径、摇杆相关、MSE），回答"微调是否有效"。
+
+**命令行微调**：
+
+```powershell
+# 小样本先验证链路（输出 NitroGen/ng_finetuned.pt）
+NitroGen\.venv\Scripts\python.exe scripts\finetune.py --game <game> --video <video> --fps <fps> --samples 500 --epochs 1 --batch 4
+# 参数：--samples 帧数（默认 500，填超过总标注帧数即用全量）/ --epochs / --batch（8GB 显存建议 1~4）/ --lr / --out 输出权重
+```
+
+**远程 GPU（可选，推荐大样本用）**：`scripts/gpu_worker.py` 是微调专用远程服务（HTTP 接口，监听内网端口），部署到带大显存的服务器（如 A100）后，本地 Web 可切换"远程后端"跑大样本微调；产物权重留远程、评估 CSV 回传本地（避免 2GB 权重来回传）。远程部署需：同仓库脚本 + `ng.pt` + 该游戏视频/标注 + siglip2 预处理缓存；缺数据时本地 Web 会自动上传（需在面板配置 SSH 凭据）。
+
+**Web 双后端微调对照**（Tab③「扩展 A · 小样本微调对照闭环」面板）：
+1. 面板顶部选后端：**本机 GPU** 或 **远程服务器**（填远程地址 + SSH 密码）；
+2. 填样本帧数 / epochs / batch（留空自动按显存，如本机 8GB→2、A100 80GB→8）；
+3. 点「启动微调并评估」→ 后台任务链：补零样本基线副本（首次）→ 微调 → 微调权重评估 → 评估 CSV 回传；
+4. 完成后自动渲染**对照表**（ng 基线 vs 微调：best shift / acc_B 主口径 / acc_A / corr / mse / Δ）；
+5. 远程后端且 Δ>0（微调有效）时出现「⬇ 下载该优质权重」按钮（后台异步拉取 2GB，不阻塞）；
+6. 面板内「运行日志（实时）」终端窗口实时显示微调/评估 stdout（3s 刷新，重启 Web 后自动恢复历史日志）；
+7. 支持**断点恢复**：本地关闭期间远程任务照跑，重开 Web 打开页面自动接管并补拉结果。
+
+> 指标口径提醒：论文报告微调 +10%~52% 相对提升是**任务完成率**口径（Gymnasium 模拟器），本表是**离线按键一致率/摇杆相关**口径，两者不等价，微调是否提升按键一致率以本表实测为准。
+
+
 
 ## 前后端工具：Web 可视化平台（扩展 C）
 
@@ -280,6 +312,14 @@ NitroGen\.venv\Scripts\python.exe scripts\plot_shift_scan.py --game <game> --vid
 | `/api/shaders` | 无 | 本地切片列表 |
 | `/api/scan_shard` | shard | 扫描合并切片 |
 | `/api/upload_shard` | 文件 | 拖拽上传切片 |
+| `/api/finetune` | game, video, samples, epochs, batch | 启动微调+评估链路（按后端分发：本机/远程） |
+| `/api/finetune/backend` | mode, url, ssh_* | 设置/查询微调后端（local/remote + SSH 凭据，凭据存本地不入库） |
+| `/api/finetune/status` | 无 | 微调链路状态 + 日志尾部 |
+| `/api/finetune/recover` | 无 | 本地重启后接管远程运行中任务/补拉已完成结果 |
+| `/api/finetune/logtail` | out, lines, game, video | 微调/评估日志尾部（前端终端窗口） |
+| `/api/finetune/compare` | game, video, samples | 零样本基线 vs 微调对照（两行指标 + Δ） |
+| `/api/finetune/pull_weight` | game, video, samples | 后台异步下载远程微调权重（2GB，不阻塞） |
+| `/api/prefs` | game, video, samples, epochs, batch | 保存/恢复上次选择的游戏视频与微调参数 |
 
 ## 必要环境变量
 
