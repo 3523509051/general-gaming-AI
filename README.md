@@ -240,28 +240,62 @@ NitroGen\.venv\Scripts\python.exe scripts\plot_shift_scan.py --game <game> --vid
 
 ## 扩展 A：小样本微调 + 零样本对照（可选，需 NVIDIA GPU）
 
-**做什么**：在官方 ng.pt 基础上，用该游戏若干标注帧做一轮行为克隆微调（flow-matching loss，视觉编码器冻结），再用 `evaluate.py --ckpt` 评估微调权重，与零样本基线逐指标对照（按键一致率 B 口径 / A 口径、摇杆相关、MSE），回答"微调是否有效"。
+**做什么**：在官方 ng.pt 基础上，用该游戏若干标注帧做一轮行为克隆微调（flow-matching loss，视觉编码器冻结），再用 `evaluate.py --ckpt` 评估微调权重，与零样本基线逐指标对照（按键一致率 B/A 口径、摇杆相关、MSE），回答"微调是否有效"。
 
-**命令行微调**：
+### 两种执行方式（Web 面板二选一）
+
+| | 方案一 · 本机 GPU | 方案二 · 远程 GPU（A100 等） |
+| --- | --- | --- |
+| 适用场景 | 8GB 以上独显、小样本（≤5k 帧） | 服务器大显存、大样本 / 全帧微调 |
+| 训练速度 | 较慢（8GB 本机自动 batch=2~4） | 快（80GB 自动 batch=8） |
+| 部署成本 | 零（本机即用） | 首次一次性部署约 30~60 分钟 |
+| 数据 | 直接用本地 `data/` | 缺数据时本地自动上传（约 10~20 分钟） |
+| 权重 | 直接存本地 | 留远程，Δ>0 时按需下载 |
+| 断点恢复 | 关页面即中断（任务在本地） | 本地关闭不影响，重开自动接管 |
+
+### 方案一：本机 GPU（开箱即用）
+
+1. 打开 Web（http://localhost:5000）→ Tab③「扩展 A · 小样本微调对照闭环」面板；
+2. 顶部后端选 **本机 GPU**；
+3. 填样本帧数（默认 1000；填超过总标注帧数即用全量）/ epochs（默认 1）/ batch（留空自动按显存，8GB→2~4）；
+4. 点「启动微调并评估」→ 自动执行：补零样本基线副本（首次）→ 本机微调 → 本机评估；
+5. 完成后对照表自动出现；「运行日志」终端窗口实时显示训练 step/loss。
+
+命令行等价：
 
 ```powershell
-# 小样本先验证链路（输出 NitroGen/ng_finetuned.pt）
+# 微调（输出 NitroGen/ng_ft_<N>.pt；--samples 超过总标注帧数即全量）
 NitroGen\.venv\Scripts\python.exe scripts\finetune.py --game <game> --video <video> --fps <fps> --samples 500 --epochs 1 --batch 4
-# 参数：--samples 帧数（默认 500，填超过总标注帧数即用全量）/ --epochs / --batch（8GB 显存建议 1~4）/ --lr / --out 输出权重
+# 评估微调权重并与零样本基线对照（--ckpt + --tag 副本）
+NitroGen\.venv\Scripts\python.exe scripts\evaluate.py --game <game> --video <video> --fps <fps> --ckpt NitroGen/ng_ft_500.pt --tag ng_ft_500
 ```
 
-**远程 GPU（可选，推荐大样本用）**：`scripts/gpu_worker.py` 是微调专用远程服务（HTTP 接口，监听内网端口），部署到带大显存的服务器（如 A100）后，本地 Web 可切换"远程后端"跑大样本微调；产物权重留远程、评估 CSV 回传本地（避免 2GB 权重来回传）。远程部署需：同仓库脚本 + `ng.pt` + 该游戏视频/标注 + siglip2 预处理缓存；缺数据时本地 Web 会自动上传（需在面板配置 SSH 凭据）。
+### 方案二：远程 GPU（A100 服务器）
 
-**Web 双后端微调对照**（Tab③「扩展 A · 小样本微调对照闭环」面板）：
-1. 面板顶部选后端：**本机 GPU** 或 **远程服务器**（填远程地址 + SSH 密码）；
-2. 填样本帧数 / epochs / batch（留空自动按显存，如本机 8GB→2、A100 80GB→8）；
-3. 点「启动微调并评估」→ 后台任务链：补零样本基线副本（首次）→ 微调 → 微调权重评估 → 评估 CSV 回传；
-4. 完成后自动渲染**对照表**（ng 基线 vs 微调：best shift / acc_B 主口径 / acc_A / corr / mse / Δ）；
-5. 远程后端且 Δ>0（微调有效）时出现「⬇ 下载该优质权重」按钮（后台异步拉取 2GB，不阻塞）；
-6. 面板内「运行日志（实时）」终端窗口实时显示微调/评估 stdout（3s 刷新，重启 Web 后自动恢复历史日志）；
-7. 支持**断点恢复**：本地关闭期间远程任务照跑，重开 Web 打开页面自动接管并补拉结果。
+**原理**：`scripts/gpu_worker.py` 是微调专用远程服务（HTTP 接口，监听内网端口 56272），只做"微调 + 评估"，产物权重留远程、评估 CSV 回传本地（避免 2GB 权重来回传卡链路）。
 
-> 指标口径提醒：论文报告微调 +10%~52% 相对提升是**任务完成率**口径（Gymnasium 模拟器），本表是**离线按键一致率/摇杆相关**口径，两者不等价，微调是否提升按键一致率以本表实测为准。
+**一次性部署（A100 上，约 30~60 分钟）**：
+1. 上传到 `/root/workspace/nitrogen_worker/`：`scripts/`（finetune.py / evaluate.py / gpu_worker.py）+ `NitroGen/ng.pt`（1.97GB）+ `NitroGen/nitrogen/` 包 + 目标游戏视频 mp4 与 `data/<game>/` 标注 + **siglip2 预处理缓存**（A100 访问不了 HuggingFace，需离线带上 config / preprocessor_config / model.safetensors）；
+2. 装依赖（torch 用阿里云 pytorch-wheels 源、其余清华 pypi 源）：`torch`（按 CUDA 版本选 cu121/cu130）+ `transformers==4.57.1` + `polars` + `pillow` + `flask` + `pydantic` + `einops` + `diffusers` + `safetensors`；
+3. 启动服务并验证：
+   ```bash
+   cd /root/workspace/nitrogen_worker && chmod +x start_worker.sh
+   setsid ./start_worker.sh > worker.log 2>&1 &
+   curl http://127.0.0.1:56272/health   # 期望返回 A100 型号 + 显存
+   ```
+
+**本地配置（一次性，30 秒）**：Tab③ 面板顶部后端选 **远程服务器** → 填 `http://<服务器IP>:56272` + SSH 密码（缺数据自动上传用，凭据存 `data/remote_worker.json`，本地文件不入库）→ 点「连接」，提示远程 GPU 在线。
+
+**日常使用**：
+1. 选游戏/视频（自动恢复上次选择）、填样本帧数/epochs/batch（留空自动按 A100 显存=8）；
+2. 点「启动微调并评估」→ 缺数据时自动上传 → 远程微调 → 远程评估 → CSV 回传本地；
+3. 终端窗口实时看进度（3s 刷新）；完成后自动渲染对照表（best shift / acc_B 主口径 / acc_A / corr / mse / Δ）；
+4. Δ>0（微调有效）时出现「⬇ 下载该优质权重」按钮（后台异步拉取 2GB，不阻塞）；
+5. 中途关本地 → 远程任务照跑 → 重开 Web 打开页面自动接管并补拉结果。
+
+**远程注意事项**：数据须放 `/root/workspace`（服务器规范）；端口只用 56272/56273、不暴露公网；换新服务器重走部署步骤即可。
+
+> 指标口径提醒：论文报告微调 +10%~52% 相对提升是**任务完成率**口径（Gymnasium 模拟器），本表是**离线按键一致率 / 摇杆相关**口径，两者不等价，微调是否提升按键一致率以本表实测为准。
 
 
 
