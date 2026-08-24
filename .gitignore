@@ -55,5 +55,10 @@ scripts/archive/
 *实施文档.md
 docs/审查纪要.md
 
+# --- 9.6 Harness 开发过程文件（开发规范/日志/自测入口，仅本地保留，不公开） ---
+docs/开发规范.md
+docs/开发日志.md
+scripts/run_checks.py
+
 # --- 10. 报告插图（模块图等，随报告本地保留） ---
 assets/
