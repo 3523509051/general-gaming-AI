@@ -28,10 +28,8 @@ cookies.txt
 # --- 5. IDE / 编辑器本地数据 ---
 .idea/
 .vscode/
-# .codebuddy 下仅保留规则文件入库（每个新对话自动注入的 agent 约束），其余不入库
-.codebuddy/*
-!.codebuddy/rules/
-.codebuddy/rules/*.tmp
+# .codebuddy 项目数据（含 rules，用户决定全部不入库）
+.codebuddy/
 
 # --- 6. 日志、临时文件与操作系统垃圾 ---
 *.log
