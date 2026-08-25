@@ -104,9 +104,13 @@ function savePrefs() {
   const sInp = document.getElementById("ftSamples");
   const eInp = document.getElementById("ftEpochs");
   const bInp = document.getElementById("ftBatch");
+  const tInp = document.getElementById("ftTestSize");
+  const fInp = document.getElementById("ftFilterIdle");
   if (sInp) p.set("samples", sInp.value || "");
   if (eInp) p.set("epochs", eInp.value || "");
   if (bInp) p.set("batch", bInp.value || "");
+  if (tInp) p.set("test_size", tInp.value || "");
+  if (fInp) p.set("filter_idle", fInp.checked ? "1" : "");
   fetch(`/api/prefs?${p}`, { method: "POST" }).catch(() => {});
 }
 
@@ -816,7 +820,7 @@ const FT_STAGE_TEXT = {
   baseline: "阶段 0/2 · 补零样本基线副本（约 2 分钟）",
   uploading: "上传游戏数据到远程（仅首次）",
   finetuning: "阶段 1/2 · 微调训练中",
-  evaluating: "阶段 2/2 · 微调权重评估中（200 帧推理）",
+  evaluating: "阶段 2/2 · 微调权重评估中",
   done: "已完成",
   failed: "失败",
 };
@@ -852,11 +856,14 @@ function renderFinetunePanel() {
     </div>
     <div class="eval-guide-form" style="margin-top:6px">
       <label for="ftSamples">样本帧数：</label>
-      <input id="ftSamples" type="number" min="2" max="50000" step="100" value="1000">
+      <input id="ftSamples" type="number" min="2" max="1000000" step="100" value="1000">
       <label for="ftEpochs" style="margin-left:12px">epochs：</label>
       <input id="ftEpochs" type="number" min="1" max="5" step="1" value="1" style="width:64px">
       <label for="ftBatch" style="margin-left:12px">batch（留空=自动）：</label>
       <input id="ftBatch" type="number" min="1" max="16" step="1" style="width:64px" placeholder="自动">
+      <label for="ftTestSize" style="margin-left:12px">测试集帧数：</label>
+      <input id="ftTestSize" type="number" min="10" max="5000" step="50" style="width:80px" placeholder="200">
+      <label style="margin-left:12px"><input id="ftFilterIdle" type="checkbox"> 过滤IDLE帧</label>
       <button id="ftStartBtn" class="primary-btn" onclick="startFinetune()">启动微调并评估</button>
       <button class="mini-btn" onclick="showFtCompare()">查看对照结果</button>
     </div>
@@ -878,6 +885,8 @@ function renderFinetunePanel() {
     } else if (r.status === "recovered") {
       showError(`已恢复远程完成结果（samples=${r.samples}），对照表已更新`);
       showFtCompare(r.samples);
+    } else if (r.status === "busy") {
+      pollFinetune();   // 本地已有任务在运行：立即轮询展示真实状态
     }
   }).catch(() => {});
   api("/api/finetune/backend").then(b => {
@@ -911,9 +920,13 @@ function renderFinetunePanel() {
     const sInp = document.getElementById("ftSamples");
     const eInp = document.getElementById("ftEpochs");
     const bInp = document.getElementById("ftBatch");
+    const tInp = document.getElementById("ftTestSize");
+    const fInp = document.getElementById("ftFilterIdle");
     if (sInp && prefs.samples) sInp.value = prefs.samples;
     if (eInp && prefs.epochs) eInp.value = prefs.epochs;
     if (bInp && prefs.batch) bInp.value = prefs.batch;
+    if (tInp && prefs.test_size) tInp.value = prefs.test_size;
+    if (fInp && prefs.filter_idle === "1") fInp.checked = true;
   }).catch(() => {});
 }
 
@@ -992,15 +1005,23 @@ async function startFinetune() {
   const samples = parseInt(sInp ? sInp.value : "", 10);
   const epochs = parseInt(eInp ? eInp.value : "", 10);
   const batchVal = bInp ? bInp.value.trim() : "";
-  if (!samples || samples < 2 || samples > 50000) { showError("样本帧数应在 2~50000 之间"); return; }
+  if (!samples || samples < 2 || samples > 1000000) { showError("样本帧数应在 2~1000000 之间"); return; }
   if (!epochs || epochs < 1 || epochs > 5) { showError("epochs 应在 1~5 之间"); return; }
   if (batchVal) {
     const batch = parseInt(batchVal, 10);
     if (!batch || batch < 1 || batch > 16) { showError("batch 应在 1~16 之间（留空则自动）"); return; }
   }
+  const testSizeVal = document.getElementById("ftTestSize") ? document.getElementById("ftTestSize").value.trim() : "";
+  if (testSizeVal) {
+    const ts = parseInt(testSizeVal, 10);
+    if (!ts || ts < 10 || ts > 5000) { showError("测试集帧数应在 10~5000 之间"); return; }
+  }
+  const filterIdle = document.getElementById("ftFilterIdle") && document.getElementById("ftFilterIdle").checked;
   const params = [`game=${encodeURIComponent(state.game)}`, `video=${encodeURIComponent(state.video)}`,
                   `samples=${samples}`, `epochs=${epochs}`];
   if (batchVal) params.push(`batch=${batchVal}`);
+  if (testSizeVal) params.push(`test_size=${testSizeVal}`);
+  if (filterIdle) params.push("filter_idle=1");
   try {
     const r = await fetch(`/api/finetune?${params.join("&")}`, { method: "POST" });
     const j = await r.json();
@@ -1070,33 +1091,42 @@ async function showFtCompare(samplesOverride) {
     const d = await api(`/api/finetune/compare?game=${encodeURIComponent(state.game)}&video=${encodeURIComponent(state.video)}&samples=${samples}`);
     const b = d.baseline, f = d.finetuned;
     const fmt = v => (v == null || Number.isNaN(v)) ? "—" : v.toFixed(4);
-    const deltaTxt = d.delta.acc_17keys_all >= 0
-      ? `<span style="color:var(--green)">+${d.delta.acc_17keys_all.toFixed(4)}</span>`
-      : `<span style="color:var(--red)">${d.delta.acc_17keys_all.toFixed(4)}</span>`;
+    const filterIdle = document.getElementById("ftFilterIdle") && document.getElementById("ftFilterIdle").checked;
+    const accKey = filterIdle ? "acc_17keys_all_nonidle" : "acc_17keys_all";
+    const bAcc = b[accKey], fAcc = f[accKey];
+    if (filterIdle && (bAcc == null || fAcc == null)) {
+      box.innerHTML = `<p class="muted">过滤 IDLE 口径需要新版 evaluate.py 重新评估（旧 metrics 无 acc_17keys_all_nonidle 列）。请在面板重新运行微调/评估（测试集帧数已可选）。</p>`;
+      return;
+    }
+    const deltaVal = d.delta[accKey] ?? null;
+    const deltaTxt = deltaVal == null ? "—"
+      : (deltaVal >= 0
+        ? `<span style="color:var(--green)">+${deltaVal.toFixed(4)}</span>`
+        : `<span style="color:var(--red)">${deltaVal.toFixed(4)}</span>`);
     box.innerHTML = `
       <table class="top5-table">
         <thead><tr>
-          <th>模型</th><th>best shift</th><th>acc_B（逐帧全对·主口径）</th>
+          <th>模型</th><th>best shift</th><th>${filterIdle ? "acc_B（非IDLE·逐帧全对）" : "acc_B（逐帧全对·主口径）"}</th>
           <th>acc_A（逐键逐帧）</th><th>corr_x</th><th>mse_x</th>
         </tr></thead>
         <tbody>
           <tr><td>ng.pt（零样本基线）</td><td class="num">${b.shift}</td>
-              <td class="num"><b>${b.acc_17keys_all.toFixed(4)}</b></td>
+              <td class="num"><b>${bAcc.toFixed(4)}</b></td>
               <td class="num">${b.acc_17keys_bits.toFixed(4)}</td>
               <td class="num">${fmt(b.corr_jl_x)}</td><td class="num">${b.mse_jl_x.toFixed(4)}</td></tr>
           <tr><td>ng_ft_${d.samples}.pt（${d.samples} 帧微调）</td><td class="num">${f.shift}</td>
-              <td class="num"><b>${f.acc_17keys_all.toFixed(4)}</b>（Δ ${deltaTxt}）</td>
+              <td class="num"><b>${fAcc.toFixed(4)}</b>（Δ ${deltaTxt}）</td>
               <td class="num">${f.acc_17keys_bits.toFixed(4)}</td>
               <td class="num">${fmt(f.corr_jl_x)}</td><td class="num">${f.mse_jl_x.toFixed(4)}</td></tr>
         </tbody>
       </table>
-      ${(FT_BACKEND_STATE.mode === "remote" && d.delta.acc_17keys_all > 0)
+      ${(FT_BACKEND_STATE.mode === "remote" && (deltaVal ?? 0) > 0)
         ? `<p style="margin-top:8px">
              <button class="primary-btn" onclick="pullWeight(${d.samples})">⬇ 下载该优质权重（约 2GB）</button>
              <span id="pwStatus" class="muted" style="margin-left:8px"></span>
            </p>`
         : ""}
-      <p class="muted" style="margin-top:6px">${d.note}（两行均为 ${b.n_frames} 帧测试集 best shift 指标）</p>`;
+      <p class="muted" style="margin-top:6px">${d.note}（两行均为 ${b.n_frames} 帧测试集 best shift 指标${filterIdle ? `，其中非 IDLE ${b.n_frames_nonidle} 帧` : ""}）</p>`;
   } catch (e) {
     box.innerHTML = `<p class="muted">暂无对照数据：${e.message}</p>`;
   }

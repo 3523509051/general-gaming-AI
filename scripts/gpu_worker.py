@@ -62,6 +62,64 @@ def health():
     return jsonify({"ok": True, "data": {**_gpu_info(), "running": _task["running"]}})
 
 
+@app.get("/has_ckpt")
+def has_ckpt():
+    """权重是否存在（本地 Web 据此跳过微调，仅重新评估）。"""
+    out = request.args.get("out", "").strip()
+    return jsonify({"ok": True, "data": {"exists": bool(out) and (OUT_DIR / Path(out).name).exists()}})
+
+
+@app.post("/eval_base")
+def eval_base():
+    """零样本基线评估（evaluate.py 无 --ckpt --tag ng），产物 CSV 供 /metrics_csv 回传。"""
+    game = request.args.get("game", "").strip()
+    video = request.args.get("video", "").strip()
+    test_size_raw = request.args.get("test_size", "").strip()
+    if not (game and video):
+        return jsonify({"ok": False, "error": "参数 game/video 必填"}), 400
+    test_size = None
+    if test_size_raw:
+        try:
+            test_size = int(test_size_raw)
+            if test_size < 10 or test_size > 5000:
+                raise ValueError
+        except ValueError:
+            return jsonify({"ok": False, "error": "test_size 应为 10~5000 整数"}), 400
+    with _lock:
+        if _task["running"]:
+            return jsonify({"ok": False, "error": "已有任务运行中"}), 409
+        _task.update(running=True, game=game, video=video, samples=None,
+                     epochs=None, batch=None, out=f"base_{video}", proc=None,
+                     test_size=test_size, eval_only=False, log_tail="", error=None,
+                     started_at=time.strftime("%H:%M:%S"), stage="baseline")
+    threading.Thread(target=_run_eval_base, args=(game, video, test_size), daemon=True).start()
+    return jsonify({"ok": True, "data": {"status": "started", "stage": "baseline"}}), 202
+
+
+def _run_eval_base(game: str, video: str, test_size: int | None):
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    log = OUT_DIR / f"base_{video}.eval.log"
+    try:
+        cmd = [str(BASE / ".venv" / "bin" / "python"), str(EVALUATE),
+               "--game", game, "--video", video, "--fps", "30",
+               "--tag", "ng", "--no-plots"]
+        if test_size:
+            cmd += ["--test-size", str(test_size)]
+        proc = subprocess.Popen(cmd, cwd=str(BASE),
+                                stdout=open(log, "w", encoding="utf-8"),
+                                stderr=subprocess.STDOUT)
+        with _lock:
+            _task["proc"] = proc
+        rc = proc.wait()
+        if rc != 0:
+            raise RuntimeError(f"基线评估退出码 {rc}，日志: {log}")
+        with _lock:
+            _task.update(running=False, stage="done", proc=None)
+    except Exception as e:  # noqa: BLE001
+        with _lock:
+            _task.update(running=False, stage="failed", proc=None, error=str(e)[:300])
+
+
 @app.post("/start")
 def start():
     game = request.args.get("game", "").strip()
@@ -70,14 +128,24 @@ def start():
     epochs = request.args.get("epochs", "1").strip()
     batch = request.args.get("batch", "4").strip()
     out = request.args.get("out", "").strip()
+    test_size_raw = request.args.get("test_size", "").strip()
+    test_size = None
+    if test_size_raw:
+        try:
+            test_size = int(test_size_raw)
+            if test_size < 10 or test_size > 5000:
+                raise ValueError
+        except ValueError:
+            return jsonify({"ok": False, "error": "test_size 应为 10~5000 整数"}), 400
+    eval_only = request.args.get("eval_only", "0").strip() in ("1", "true", "yes")
     if not (game and video and samples and out):
         return jsonify({"ok": False, "error": "参数 game/video/samples/out 必填"}), 400
     try:
         samples_i = int(samples)
-        if samples_i < 2 or samples_i > 50000:
+        if samples_i < 2 or samples_i > 1000000:
             raise ValueError
     except ValueError:
-        return jsonify({"ok": False, "error": "samples 应为 2~50000 整数"}), 400
+        return jsonify({"ok": False, "error": "samples 应为 2~1000000 整数"}), 400
     # out 限定为纯文件名，防路径穿越
     out = Path(out).name
     if not out.endswith(".pt"):
@@ -87,41 +155,50 @@ def start():
             return jsonify({"ok": False, "error": "已有微调任务运行中"}), 409
         _task.update(running=True, game=game, video=video, samples=samples_i,
                      epochs=int(epochs), batch=int(batch), out=out, proc=None,
-                     log_tail="", error=None, started_at=time.strftime("%H:%M:%S"),
-                     stage="finetuning")
+                     test_size=test_size, eval_only=eval_only, log_tail="", error=None,
+                     started_at=time.strftime("%H:%M:%S"), stage="finetuning")
     threading.Thread(target=_run, args=(game, video, samples_i, int(epochs),
-                                        int(batch), out), daemon=True).start()
+                                        int(batch), out, test_size, eval_only), daemon=True).start()
     return jsonify({"ok": True, "data": {"status": "started", "out": out,
                                          "samples": samples_i}}), 202
 
 
-def _run(game: str, video: str, samples: int, epochs: int, batch: int, out: str):
+def _run(game: str, video: str, samples: int, epochs: int, batch: int, out: str,
+         test_size: int | None = None, eval_only: bool = False):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     tag = out[:-3] if out.endswith(".pt") else out
     log = OUT_DIR / f"{out}.log"
     eval_log = OUT_DIR / f"{out}.eval.log"
     try:
-        # 阶段 1：微调
-        with _lock:
-            _task["stage"] = "finetuning"
-        cmd = [str(BASE / ".venv" / "bin" / "python"), str(FINETUNE),
-               "--game", game, "--video", video, "--fps", "30",
-               "--samples", str(samples), "--epochs", str(epochs),
-               "--batch", str(batch), "--out", str(OUT_DIR / out)]
-        proc = subprocess.Popen(cmd, cwd=str(BASE),
-                                stdout=open(log, "w", encoding="utf-8"),
-                                stderr=subprocess.STDOUT)
-        with _lock:
-            _task["proc"] = proc
-        rc = proc.wait()
-        if rc != 0:
-            raise RuntimeError(f"finetune 退出码 {rc}，日志: {log}")
+        # 阶段 1：微调（eval_only 时跳过——权重已存在，仅重新评估）
+        if eval_only:
+            with _lock:
+                _task["stage"] = "evaluating"
+            with open(log, "a", encoding="utf-8") as f:
+                f.write("[worker] eval_only：权重已存在，跳过微调，直接评估\n")
+        else:
+            with _lock:
+                _task["stage"] = "finetuning"
+            cmd = [str(BASE / ".venv" / "bin" / "python"), str(FINETUNE),
+                   "--game", game, "--video", video, "--fps", "30",
+                   "--samples", str(samples), "--epochs", str(epochs),
+                   "--batch", str(batch), "--out", str(OUT_DIR / out)]
+            proc = subprocess.Popen(cmd, cwd=str(BASE),
+                                    stdout=open(log, "w", encoding="utf-8"),
+                                    stderr=subprocess.STDOUT)
+            with _lock:
+                _task["proc"] = proc
+            rc = proc.wait()
+            if rc != 0:
+                raise RuntimeError(f"finetune 退出码 {rc}，日志: {log}")
         # 阶段 2：评估（A100 上 evaluate.py --ckpt --no-plots，产物 CSV 由 /metrics_csv 回传）
         with _lock:
             _task["stage"] = "evaluating"
         cmd = [str(BASE / ".venv" / "bin" / "python"), str(EVALUATE),
                "--game", game, "--video", video, "--fps", "30",
                "--ckpt", str(OUT_DIR / out), "--tag", tag, "--no-plots"]
+        if test_size:
+            cmd += ["--test-size", str(test_size)]
         proc = subprocess.Popen(cmd, cwd=str(BASE),
                                 stdout=open(eval_log, "w", encoding="utf-8"),
                                 stderr=subprocess.STDOUT)
@@ -205,7 +282,8 @@ def metrics_csv():
     game = request.args.get("game", "").strip()
     video = request.args.get("video", "").strip()
     samples = request.args.get("samples", "").strip()
-    tag = f"ng_ft_{samples}"
+    tag_raw = request.args.get("tag", "").strip()
+    tag = tag_raw if tag_raw else f"ng_ft_{samples}"
     p = DATA / game / "eval" / f"metrics_{video}_{tag}.csv"
     if not p.exists():
         return jsonify({"ok": False, "error": f"远程无指标文件 {p.name}"}), 404
@@ -218,7 +296,8 @@ def predictions_csv():
     game = request.args.get("game", "").strip()
     video = request.args.get("video", "").strip()
     samples = request.args.get("samples", "").strip()
-    tag = f"ng_ft_{samples}"
+    tag_raw = request.args.get("tag", "").strip()
+    tag = tag_raw if tag_raw else f"ng_ft_{samples}"
     p = DATA / game / "eval" / f"predictions_{video}_{tag}.csv"
     if not p.exists():
         return jsonify({"ok": False, "error": f"远程无预测文件 {p.name}"}), 404

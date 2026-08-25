@@ -461,6 +461,11 @@ def main():
             "corr_jl_x": pearson(pred_jl[:, 0], gt_jl[:, 0]),
             "corr_jl_y": pearson(pred_jl[:, 1], gt_jl[:, 1]),
             "n_frames": len(rows),
+            # 过滤 IDLE 口径：仅非 IDLE 帧（is_idle=双摇杆幅度≤0.1 且 17 键全 0）的逐帧全对
+            "acc_17keys_all_nonidle": float(
+                (pred_btn17 == gt_btn)[~idle_mask].all(axis=1).mean()
+            ) if (~idle_mask).any() else float("nan"),
+            "n_frames_nonidle": int((~idle_mask).sum()),
         }
         metrics.append(m)
 
