@@ -368,14 +368,18 @@ NitroGen\.venv\Scripts\python.exe scripts\evaluate.py --game <game> --video <vid
 | `/api/shaders` | 无 | 本地切片列表 |
 | `/api/scan_shard` | shard | 扫描合并切片 |
 | `/api/upload_shard` | 文件 | 拖拽上传切片 |
-| `/api/finetune` | game, video, samples, epochs, batch | 启动微调+评估链路（按后端分发：本机/远程） |
+| `/api/finetune` | game, video, samples, epochs, batch, test_size(10~5000), filter_idle(0/1), eval_repeats(1~5) | 启动微调+评估链路（按后端分发：本机/远程；权重已存在且参数一致时自动跳过微调仅重评估；eval_repeats>1 时多推理 seed 评估取均值±std） |
 | `/api/finetune/backend` | mode, url, ssh_* | 设置/查询微调后端（local/remote + SSH 凭据，凭据存本地不入库） |
 | `/api/finetune/status` | 无 | 微调链路状态 + 日志尾部 |
+| `/api/finetune/cancel` | 无 | 取消本地/远程微调任务 |
 | `/api/finetune/recover` | 无 | 本地重启后接管远程运行中任务/补拉已完成结果 |
 | `/api/finetune/logtail` | out, lines, game, video | 微调/评估日志尾部（前端终端窗口） |
-| `/api/finetune/compare` | game, video, samples | 零样本基线 vs 微调对照（两行指标 + Δ） |
+| `/api/finetune/compare` | game, video, samples | 零样本基线 vs 微调对照（两行指标 + Δ；多副本评估时显示均值±std） |
 | `/api/finetune/pull_weight` | game, video, samples | 后台异步下载远程微调权重（2GB，不阻塞） |
-| `/api/prefs` | game, video, samples, epochs, batch | 保存/恢复上次选择的游戏视频与微调参数 |
+| `/api/finetune/pull_weight/status` | 无 | 权重下载进度 |
+| `/api/prefs` | game, video, samples, epochs, batch, test_size, filter_idle, eval_repeats | 保存/恢复上次选择的游戏视频与微调参数 |
+
+**远程 worker 接口**（部署于服务器，端口 56272）：`/health`（GPU 信息+任务状态）、`/start`（启动微调+评估，含 eval_only/test_size/eval_repeats）、`/eval_base`（零样本基线评估）、`/has_ckpt`（权重存在性+训练参数 meta）、`/status`、`/cancel`、`/data_check`（视频/标注齐全性）、`/logtail`（日志尾部）、`/metrics_csv`、`/predictions_csv`（评估结果回传）、`/download`（权重下载）。
 
 ## 必要环境变量
 

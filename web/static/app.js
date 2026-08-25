@@ -106,11 +106,13 @@ function savePrefs() {
   const bInp = document.getElementById("ftBatch");
   const tInp = document.getElementById("ftTestSize");
   const fInp = document.getElementById("ftFilterIdle");
+  const rInp = document.getElementById("ftRepeats");
   if (sInp) p.set("samples", sInp.value || "");
   if (eInp) p.set("epochs", eInp.value || "");
   if (bInp) p.set("batch", bInp.value || "");
   if (tInp) p.set("test_size", tInp.value || "");
   if (fInp) p.set("filter_idle", fInp.checked ? "1" : "");
+  if (rInp) p.set("eval_repeats", rInp.value || "");
   fetch(`/api/prefs?${p}`, { method: "POST" }).catch(() => {});
 }
 
@@ -864,6 +866,8 @@ function renderFinetunePanel() {
       <label for="ftTestSize" style="margin-left:12px">测试集帧数：</label>
       <input id="ftTestSize" type="number" min="10" max="5000" step="50" style="width:80px" placeholder="200">
       <label style="margin-left:12px"><input id="ftFilterIdle" type="checkbox"> 过滤IDLE帧</label>
+      <label for="ftRepeats" style="margin-left:12px" title="同权重用不同推理 seed 评估 N 次，对照表显示均值±std，判断微调差异是真实还是采样噪声">评估次数：</label>
+      <input id="ftRepeats" type="number" min="1" max="5" step="1" value="1" style="width:52px" title="评估 N 次取均值±std（默认 1）">
       <button id="ftStartBtn" class="primary-btn" onclick="startFinetune()">启动微调并评估</button>
       <button class="mini-btn" onclick="showFtCompare()">查看对照结果</button>
     </div>
@@ -922,11 +926,13 @@ function renderFinetunePanel() {
     const bInp = document.getElementById("ftBatch");
     const tInp = document.getElementById("ftTestSize");
     const fInp = document.getElementById("ftFilterIdle");
+    const rInp = document.getElementById("ftRepeats");
     if (sInp && prefs.samples) sInp.value = prefs.samples;
     if (eInp && prefs.epochs) eInp.value = prefs.epochs;
     if (bInp && prefs.batch) bInp.value = prefs.batch;
     if (tInp && prefs.test_size) tInp.value = prefs.test_size;
     if (fInp && prefs.filter_idle === "1") fInp.checked = true;
+    if (rInp && prefs.eval_repeats) rInp.value = prefs.eval_repeats;
   }).catch(() => {});
 }
 
@@ -1017,11 +1023,17 @@ async function startFinetune() {
     if (!ts || ts < 10 || ts > 5000) { showError("测试集帧数应在 10~5000 之间"); return; }
   }
   const filterIdle = document.getElementById("ftFilterIdle") && document.getElementById("ftFilterIdle").checked;
+  const repeatsVal = document.getElementById("ftRepeats") ? document.getElementById("ftRepeats").value.trim() : "";
+  if (repeatsVal) {
+    const rp = parseInt(repeatsVal, 10);
+    if (!rp || rp < 1 || rp > 5) { showError("评估次数应在 1~5 之间"); return; }
+  }
   const params = [`game=${encodeURIComponent(state.game)}`, `video=${encodeURIComponent(state.video)}`,
                   `samples=${samples}`, `epochs=${epochs}`];
   if (batchVal) params.push(`batch=${batchVal}`);
   if (testSizeVal) params.push(`test_size=${testSizeVal}`);
   if (filterIdle) params.push("filter_idle=1");
+  if (repeatsVal) params.push(`eval_repeats=${repeatsVal}`);
   try {
     const r = await fetch(`/api/finetune?${params.join("&")}`, { method: "POST" });
     const j = await r.json();
@@ -1094,6 +1106,9 @@ async function showFtCompare(samplesOverride) {
     const filterIdle = document.getElementById("ftFilterIdle") && document.getElementById("ftFilterIdle").checked;
     const accKey = filterIdle ? "acc_17keys_all_nonidle" : "acc_17keys_all";
     const bAcc = b[accKey], fAcc = f[accKey];
+    const bStd = b[accKey + "_std"], fStd = f[accKey + "_std"];
+    const fmtAcc = (v, sd) => sd != null && v != null ? `${v.toFixed(4)} ± ${sd.toFixed(4)}`
+                : (v == null ? "—" : v.toFixed(4));
     if (filterIdle && (bAcc == null || fAcc == null)) {
       box.innerHTML = `<p class="muted">过滤 IDLE 口径需要新版 evaluate.py 重新评估（旧 metrics 无 acc_17keys_all_nonidle 列）。请在面板重新运行微调/评估（测试集帧数已可选）。</p>`;
       return;
@@ -1111,11 +1126,11 @@ async function showFtCompare(samplesOverride) {
         </tr></thead>
         <tbody>
           <tr><td>ng.pt（零样本基线）</td><td class="num">${b.shift}</td>
-              <td class="num"><b>${bAcc.toFixed(4)}</b></td>
+              <td class="num"><b>${fmtAcc(bAcc, bStd)}</b></td>
               <td class="num">${b.acc_17keys_bits.toFixed(4)}</td>
               <td class="num">${fmt(b.corr_jl_x)}</td><td class="num">${b.mse_jl_x.toFixed(4)}</td></tr>
           <tr><td>ng_ft_${d.samples}.pt（${d.samples} 帧微调）</td><td class="num">${f.shift}</td>
-              <td class="num"><b>${fAcc.toFixed(4)}</b>（Δ ${deltaTxt}）</td>
+              <td class="num"><b>${fmtAcc(fAcc, fStd)}</b>（Δ ${deltaTxt}）</td>
               <td class="num">${f.acc_17keys_bits.toFixed(4)}</td>
               <td class="num">${fmt(f.corr_jl_x)}</td><td class="num">${f.mse_jl_x.toFixed(4)}</td></tr>
         </tbody>

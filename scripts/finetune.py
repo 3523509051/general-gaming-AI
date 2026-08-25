@@ -212,6 +212,15 @@ def main():
     print("[4/4] saving ...", flush=True)
     torch.save({"model": model.state_dict(), "ckpt_config": ckpt_config.model_dump()}, args.out)
     print(f"      saved -> {args.out}")
+    # 记录训练参数（供链路"跳过微调"校验：权重存在但参数变了必须重训）
+    try:
+        import json
+        meta = {"samples": args.samples, "epochs": args.epochs, "batch": args.batch,
+                "lr": args.lr, "seed": args.seed, "game": args.game, "video": args.video}
+        Path(str(args.out) + ".meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        print(f"      meta -> {args.out}.meta.json")
+    except Exception as e:  # noqa: BLE001
+        print(f"      meta 写入失败（不影响训练）: {e}")
     print("FINETUNE DONE")
     return 0
 

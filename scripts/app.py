@@ -1293,7 +1293,7 @@ def api_evaluate_cancel():
 _ft_task = {"running": False, "game": None, "video": None, "stage": "idle",
             "samples": None, "epochs": None, "batch": None, "gpu_note": "",
             "backend": "local", "remote_url": "", "out": None,
-            "test_size": None, "filter_idle": False,
+            "test_size": None, "filter_idle": False, "eval_repeats": 1,
             "log_tail": "", "error": None, "started_at": None, "proc": None}
 _ft_lock = threading.Lock()
 
@@ -1385,16 +1385,36 @@ def remote_start(url: str, params: dict) -> tuple[int, dict | str]:
         return 500, str(e)
 
 
-def remote_has_ckpt(url: str, out: str) -> bool:
-    """远程权重是否已存在（存在则跳过微调，仅重新评估）。"""
+def remote_has_ckpt(url: str, out: str) -> dict:
+    """远程权重信息：{"exists": bool, "meta": dict|None}（meta 含训练参数，供跳过微调校验）。"""
     import urllib.parse
     import urllib.request
     qs = urllib.parse.urlencode({"out": out})
     try:
         with urllib.request.urlopen(f"{url}/has_ckpt?{qs}", timeout=8) as r:
-            return bool(json.load(r).get("data", {}).get("exists"))
+            d = json.load(r).get("data", {})
+            return {"exists": bool(d.get("exists")), "meta": d.get("meta")}
     except Exception:  # noqa: BLE001
+        return {"exists": False, "meta": None}
+
+
+def _meta_matches(meta, samples: int, epochs: int, batch: int) -> bool:
+    """权重 meta 与当前训练参数一致才可跳过微调；无 meta（旧权重）保守跳过以兼容。"""
+    if not meta:
+        return True
+    return (meta.get("samples") == samples and meta.get("epochs") == epochs
+            and meta.get("batch") == batch)
+
+
+def _ckpt_matches(ckpt_path: Path, samples: int, epochs: int, batch: int) -> bool:
+    """本地权重存在且训练参数一致才跳过微调；参数变了（如 epochs 1→2）需重训覆盖。"""
+    if not ckpt_path.exists():
         return False
+    try:
+        meta = json.loads(Path(str(ckpt_path) + ".meta.json").read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return True  # 旧权重无 meta：跳过（兼容）；想重训可删除权重文件
+    return _meta_matches(meta, samples, epochs, batch)
 
 
 def _csv_n_frames(path: Path) -> int | None:
@@ -1447,27 +1467,60 @@ def remote_fetch_weight(url: str, out: str, dest: Path, log_fn=None) -> None:
 
 
 def remote_fetch_csv(url: str, game: str, video: str, samples: int,
-                     dest_dir: Path, log_fn=None, tag: str | None = None) -> str:
-    """从远程 worker 拉评估 CSV（metrics + predictions）回本地（KB 级，替代 2GB 权重回传）。"""
+                     dest_dir: Path, log_fn=None, tag: str | None = None,
+                     repeats: int = 1) -> str:
+    """从远程 worker 拉评估 CSV 回本地。
+
+    容错：先探测主副本是否存在；若远程只有 _s{i} 副本（如 recover 接管后
+    eval_repeats 与原始请求不一致），自动逐个探测 _s0.._sN 拉全副本。
+    """
+    import urllib.error
     import urllib.parse
     import urllib.request
     tag = tag or f"ng_ft_{samples}"
-    qs = urllib.parse.urlencode({"game": game, "video": video, "tag": tag})
     dest_dir.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(f"{url}/metrics_csv?{qs}", timeout=120) as r:
-        (dest_dir / f"metrics_{video}_{tag}.csv").write_text(
-            r.read().decode("utf-8"), encoding="utf-8")
-    if log_fn:
-        log_fn(f"metrics_{video}_{tag}.csv 已回传")
-    try:
-        with urllib.request.urlopen(f"{url}/predictions_csv?{qs}", timeout=300) as r:
-            (dest_dir / f"predictions_{video}_{tag}.csv").write_text(
+
+    def _metrics_exists(rtag: str) -> bool:
+        qs = urllib.parse.urlencode({"game": game, "video": video, "tag": rtag})
+        try:
+            with urllib.request.urlopen(f"{url}/metrics_csv?{qs}", timeout=15) as r:
+                return True
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return False
+            raise
+
+    # 决定要拉哪些副本：主副本存在则只拉主副本；否则探测 _s0.._sN
+    if _metrics_exists(tag):
+        targets = [tag]
+    else:
+        targets = []
+        for i in range(5):
+            t = f"{tag}_s{i}"
+            if _metrics_exists(t):
+                targets.append(t)
+            else:
+                break
+    if not targets:
+        raise RuntimeError(f"远程无 {tag} 的评估副本（metrics_csv 均 404）")
+
+    for rtag in targets:
+        qs = urllib.parse.urlencode({"game": game, "video": video, "tag": rtag})
+        with urllib.request.urlopen(f"{url}/metrics_csv?{qs}", timeout=120) as r:
+            (dest_dir / f"metrics_{video}_{rtag}.csv").write_text(
                 r.read().decode("utf-8"), encoding="utf-8")
         if log_fn:
-            log_fn(f"predictions_{video}_{tag}.csv 已回传")
-    except Exception as e:  # noqa: BLE001
-        if log_fn:
-            log_fn(f"predictions 拉取失败（可选，不影响对照）: {e}")
+            log_fn(f"metrics_{video}_{rtag}.csv 已回传")
+        if rtag == tag:  # 主副本才拉 predictions（重复评估只回传 metrics，对照表不读预测明细）
+            try:
+                with urllib.request.urlopen(f"{url}/predictions_csv?{qs}", timeout=300) as r:
+                    (dest_dir / f"predictions_{video}_{rtag}.csv").write_text(
+                        r.read().decode("utf-8"), encoding="utf-8")
+                if log_fn:
+                    log_fn(f"predictions_{video}_{rtag}.csv 已回传")
+            except Exception as e:  # noqa: BLE001
+                if log_fn:
+                    log_fn(f"predictions 拉取失败（可选，不影响对照）: {e}")
     return tag
 
 
@@ -1584,14 +1637,16 @@ def _ft_stage(cmd: list[str], log: Path) -> int:
 def _run_finetune_chain(game: str, video: str, fps: int,
                         samples: int, epochs: int, batch: int,
                         backend: str = "local", remote_url: str = "",
-                        test_size: int | None = None, filter_idle: bool = False):
+                        test_size: int | None = None, filter_idle: bool = False,
+                        eval_repeats: int = 1):
     tag = f"ng_ft_{samples}"
     ckpt_rel = f"NitroGen/{tag}.pt"
     log = DATA_ROOT / f"finetune_{game}_{video}.log"
     with open(log, "w", encoding="utf-8") as f:
         f.write(f"[chain] game={game} video={video} samples={samples} "
                 f"epochs={epochs} batch={batch} backend={backend} "
-                f"test_size={test_size} filter_idle={filter_idle} out={ckpt_rel}\n")
+                f"test_size={test_size} filter_idle={filter_idle} "
+                f"eval_repeats={eval_repeats} out={ckpt_rel}\n")
 
     def _log(msg: str):
         with open(log, "a", encoding="utf-8") as f:
@@ -1656,14 +1711,22 @@ def _run_finetune_chain(game: str, video: str, fps: int,
                 _log("远程数据齐备，跳过上传")
             _log(f"=== 阶段 1/2：远程微调+评估（{remote_url}，samples={samples} epochs={epochs} batch={batch}） ===")
             out_name = f"{tag}.pt"
-            skip_ft = remote_has_ckpt(remote_url, out_name)
+            ckpt_info = remote_has_ckpt(remote_url, out_name)
+            skip_ft = ckpt_info.get("exists") and _meta_matches(
+                ckpt_info.get("meta"), samples, epochs, batch)
             if skip_ft:
-                _log(f"远程权重已存在（output/{out_name}），跳过微调，仅重新评估（test_size={test_size or 200}）")
+                _log(f"远程权重已存在且训练参数一致（output/{out_name}），跳过微调，仅重新评估（test_size={test_size or 200}）")
+            else:
+                _log("=== 需要重新微调："
+                     + ("远程权重不存在" if not ckpt_info.get("exists")
+                        else f"训练参数变化（当前 samples={samples} epochs={epochs} batch={batch} 与已存权重不一致）")
+                     + f"，将覆盖 output/{out_name} ===")
             code, resp = remote_start(remote_url, {
                 "game": game, "video": video, "samples": samples,
                 "epochs": epochs, "batch": batch, "out": out_name,
                 "test_size": test_size if test_size else 200,
-                "eval_only": "1" if skip_ft else "0"})
+                "eval_only": "1" if skip_ft else "0",
+                "eval_repeats": str(max(1, eval_repeats))})
             if code != 202:
                 raise RuntimeError(f"远程微调启动失败（{code}）: {resp}")
             # 轮询远程状态直到完成（复用函数，供 recover 接管）
@@ -1673,12 +1736,13 @@ def _run_finetune_chain(game: str, video: str, fps: int,
             # 回传评估 CSV（KB 级，权重留远程按需下载）
             _log("=== 拉取远程评估结果 CSV 回本地 ===")
             remote_fetch_csv(remote_url, game, video, samples,
-                             DATA_ROOT / game / "eval", log_fn=_log)
+                             DATA_ROOT / game / "eval", log_fn=_log,
+                             repeats=max(1, eval_repeats))
             _log(f"对照数据就绪（权重留远程：output/{out_name}，可在面板按需下载）")
         else:
             ckpt_path = REPO / ckpt_rel
-            if ckpt_path.exists():
-                _log(f"=== 阶段 1/2：本机权重已存在（{ckpt_rel}），跳过微调，直接评估 ===")
+            if _ckpt_matches(ckpt_path, samples, epochs, batch):
+                _log(f"=== 阶段 1/2：本机权重已存在且训练参数一致（{ckpt_rel}），跳过微调，直接评估 ===")
             else:
                 _log(f"=== 阶段 1/2：本机微调（samples={samples} epochs={epochs} batch={batch}） ===")
                 rc = _ft_stage([sys.executable, str(REPO / "scripts" / "finetune.py"),
@@ -1690,15 +1754,18 @@ def _run_finetune_chain(game: str, video: str, fps: int,
             # 阶段 2：本机微调权重评估（remote 后端评估已在远程完成，只回传 CSV）
             with _ft_lock:
                 _ft_task.update(stage="evaluating")
-            _log(f"=== 阶段 2/2：本机微调权重评估（--ckpt {ckpt_rel} --tag {tag}） ===")
-            eval_cmd = [sys.executable, str(REPO / "scripts" / "evaluate.py"),
-                        "--game", game, "--video", video, "--fps", str(fps),
-                        "--ckpt", ckpt_rel, "--tag", tag]
-            if test_size is not None:
-                eval_cmd += ["--test-size", str(test_size)]
-            rc = _ft_stage(eval_cmd, log)
-            if rc != 0:
-                raise RuntimeError(f"微调权重评估失败（退出码 {rc}），日志: data/finetune_{game}_{video}.log")
+            reps = max(1, eval_repeats)
+            for i in range(reps):
+                rtag = tag if reps == 1 else f"{tag}_s{i}"
+                _log(f"=== 阶段 2/2：本机微调权重评估（--ckpt {ckpt_rel} --tag {rtag} --infer-seed {i}）[{i+1}/{reps}] ===")
+                eval_cmd = [sys.executable, str(REPO / "scripts" / "evaluate.py"),
+                            "--game", game, "--video", video, "--fps", str(fps),
+                            "--ckpt", ckpt_rel, "--tag", rtag, "--infer-seed", str(i)]
+                if test_size is not None:
+                    eval_cmd += ["--test-size", str(test_size)]
+                rc = _ft_stage(eval_cmd, log)
+                if rc != 0:
+                    raise RuntimeError(f"微调权重评估失败（退出码 {rc}），日志: data/finetune_{game}_{video}.log")
 
         clear_cache(game)
         with _ft_lock:
@@ -1755,6 +1822,16 @@ def api_finetune():
         except ValueError:
             return err("test_size 必须是整数", 400)
     filter_idle = request.args.get("filter_idle", "0").strip() in ("1", "true", "yes")
+    # 评估重复次数：同权重不同推理 seed 各评估一次，取均值±std（判断差异是真实还是噪声）
+    repeats_raw = request.args.get("eval_repeats", "").strip()
+    eval_repeats = 1
+    if repeats_raw:
+        try:
+            eval_repeats = int(repeats_raw)
+            if eval_repeats < 1 or eval_repeats > 5:
+                return err("eval_repeats 应在 1~5 之间", 400)
+        except ValueError:
+            return err("eval_repeats 必须是整数", 400)
 
     assert_lineage(game, video)
     if backend == "remote":
@@ -1781,12 +1858,12 @@ def api_finetune():
         _ft_task.update(running=True, game=game, video=video, stage="finetuning",
                         samples=samples, epochs=epochs, batch=batch, gpu_note=gpu_note,
                         backend=backend, remote_url=remote_url, out=f"ng_ft_{samples}.pt",
-                        test_size=test_size, filter_idle=filter_idle,
+                        test_size=test_size, filter_idle=filter_idle, eval_repeats=eval_repeats,
                         log_tail="", error=None,
                         started_at=time.strftime("%H:%M:%S"), proc=None)
     threading.Thread(target=_run_finetune_chain,
                      args=(game, video, fps, samples, epochs, batch, backend, remote_url,
-                           test_size, filter_idle),
+                           test_size, filter_idle, eval_repeats),
                      daemon=True).start()
     return jsonify({"ok": True, "data": {"status": "started", "game": game,
                                          "video": video, "fps": fps, "samples": samples,
@@ -1794,7 +1871,8 @@ def api_finetune():
                                          "backend": backend, "remote_url": remote_url,
                                          "gpu_note": gpu_note,
                                          "test_size": test_size,
-                                         "filter_idle": filter_idle}}), 202
+                                         "filter_idle": filter_idle,
+                                         "eval_repeats": eval_repeats}}), 202
 
 
 @app.post("/api/finetune/backend")
@@ -1929,25 +2007,81 @@ def api_finetune_compare():
             "n_frames": int(r["n_frames"]),
         }
 
-    base = best_row(DATA_ROOT / game / "eval" / f"metrics_{video}_ng.csv")
-    ft = best_row(DATA_ROOT / game / "eval" / f"metrics_{video}_{tag}.csv")
-    if base is None:
+    def multi_rows(prefix: Path) -> list[dict]:
+        """读 _s0.._sN 副本（重复评估产物，优先）或单主副本，返回各自 best row 列表。"""
+        stem = prefix.with_suffix("")  # metrics_xxx_ng_ft_174000（去掉 .csv 后加 _s{i}）
+        sub = []
+        for i in range(5):
+            p = Path(f"{stem}_s{i}.csv")
+            if p.exists():
+                r = best_row(p)
+                if r:
+                    sub.append(r)
+        if len(sub) >= 2:  # 多次重复评估产物优先（避免读到旧单次主副本）
+            return sub
+        if prefix.exists():
+            r = best_row(prefix)
+            if r:
+                return [r]
+        return sub
+
+    def stat(rows: list[dict], key: str) -> tuple:
+        """样本均值 / 样本内标准差（N<2 时 std=None）。"""
+        vals = [r[key] for r in rows if r.get(key) is not None]
+        if not vals:
+            return None, None
+        mean = sum(vals) / len(vals)
+        std = (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5 if len(vals) > 1 else None
+        return mean, std
+
+    def pack(rows: list[dict]) -> dict:
+        b = rows[0]
+        am, ast = stat(rows, "acc_17keys_all")
+        nam, nast = stat(rows, "acc_17keys_all_nonidle")
+        abm, abst = stat(rows, "acc_17keys_bits")
+        cm, cst = stat(rows, "corr_jl_x")
+        mm, mst = stat(rows, "mse_jl_x")
+        return {
+            "shift": b["shift"],
+            "acc_17keys_all": round(am, 4) if am is not None else None,
+            "acc_17keys_all_std": round(ast, 4) if ast is not None else None,
+            "acc_17keys_all_nonidle": round(nam, 4) if nam is not None else None,
+            "acc_17keys_all_nonidle_std": round(nast, 4) if nast is not None else None,
+            "acc_17keys_bits": round(abm, 4) if abm is not None else None,
+            "corr_jl_x": round(cm, 4) if cm is not None else None,
+            "mse_jl_x": round(mm, 4) if mm is not None else None,
+            "n_frames": b["n_frames"],
+            "n_frames_nonidle": b["n_frames_nonidle"],
+            "repeats": len(rows),
+        }
+
+    base_rows = multi_rows(DATA_ROOT / game / "eval" / f"metrics_{video}_ng.csv")
+    ft_rows = multi_rows(DATA_ROOT / game / "eval" / f"metrics_{video}_{tag}.csv")
+    if not base_rows:
         return err(f"缺少零样本基线副本 metrics_{video}_ng.csv（先跑一次微调链或评估）", 404)
-    if ft is None:
+    if not ft_rows:
         return err(f"缺少微调副本 metrics_{video}_{tag}.csv（samples={samples} 的微调尚未完成）", 404)
+    base = pack(base_rows)
+    ft = pack(ft_rows)
+
+    def delta(k):
+        if base[k] is None or ft[k] is None:
+            return None
+        return round(ft[k] - base[k], 4)
+
+    n_repeat = max(len(base_rows), len(ft_rows))
     return ok({
         "game": game, "video": video, "samples": samples,
         "baseline": base, "finetuned": ft,
         "delta": {
-            "acc_17keys_all": round(ft["acc_17keys_all"] - base["acc_17keys_all"], 4),
-            "acc_17keys_all_nonidle": round(
-                ft["acc_17keys_all_nonidle"] - base["acc_17keys_all_nonidle"], 4)
-                if (ft["acc_17keys_all_nonidle"] is not None
-                    and base["acc_17keys_all_nonidle"] is not None) else None,
-            "acc_17keys_bits": round(ft["acc_17keys_bits"] - base["acc_17keys_bits"], 4),
+            "acc_17keys_all": delta("acc_17keys_all"),
+            "acc_17keys_all_nonidle": delta("acc_17keys_all_nonidle"),
+            "acc_17keys_bits": delta("acc_17keys_bits"),
         },
         "note": "论文口径为任务完成率（微调 +10%~52% 相对提升）；本表为离线口径"
-                "（按键一致率 B/摇杆相关），两者不等价，差异小属正常。",
+                "（按键一致率 B/摇杆相关），两者不等价，差异小属正常。"
+                + (f"（各评估 {n_repeat} 次取均值±std，判断差异是否落在推理采样波动内）"
+                   if n_repeat > 1 else ""),
     })
 
 
@@ -1984,6 +2118,9 @@ def api_finetune_recover():
         with _ft_lock:
             _ft_task.update(running=True, game=game, video=video, samples=samples_i,
                             epochs=st.get("epochs"), batch=st.get("batch"),
+                            test_size=st.get("test_size"),
+                            filter_idle=bool(st.get("filter_idle")),
+                            eval_repeats=st.get("eval_repeats") or 1,
                             stage=st.get("stage") or "finetuning", backend="remote",
                             remote_url=url, out=st.get("out"), gpu_note="恢复远程任务",
                             error=None, started_at=st.get("started_at"), proc=None)
@@ -2151,7 +2288,7 @@ def api_prefs_set():
         prefs["game"] = game
     if video:
         prefs["video"] = video
-    for k in ("samples", "epochs", "batch", "test_size", "filter_idle"):
+    for k in ("samples", "epochs", "batch", "test_size", "filter_idle", "eval_repeats"):
         if k in request.args:
             v = request.args.get(k, "").strip()
             if v:

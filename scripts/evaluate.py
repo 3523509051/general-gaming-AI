@@ -318,6 +318,9 @@ def main():
     ap.add_argument("--test-size", type=int, default=200,
                     help="测试集帧数（默认 200，可在 Web 平台评估引导处调整）")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--infer-seed", type=int, default=None,
+                    help="推理采样种子（不传=不固定；传值则推理前 torch.manual_seed，同 seed 结果可复现；"
+                         "多组重复评估取均值时传不同值）")
     ap.add_argument("--rebuild-testset", action="store_true", help="强制重建测试集")
     ap.add_argument("--sample-mode", choices=["random", "stratified"], default="random",
                     help="抽样方式：random=纯随机（论文口径，默认）/ stratified=按chunk均摊（旧行为）")
@@ -414,6 +417,10 @@ def main():
     t0 = time.time()
     session = InferenceSession.from_ckpt(str(ckpt))
     print(f"      loaded in {time.time()-t0:.1f}s", flush=True)
+    if args.infer_seed is not None:
+        import torch
+        torch.manual_seed(args.infer_seed)
+        print(f"      torch.manual_seed({args.infer_seed})（推理采样可复现）", flush=True)
     preds = []
     t0 = time.time()
     for i, r in enumerate(rows):

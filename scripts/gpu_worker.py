@@ -21,6 +21,7 @@
     HF_HUB_OFFLINE=1 .venv/bin/python scripts/gpu_worker.py --port 56272
 """
 import argparse
+import json
 import subprocess
 import sys
 import threading
@@ -40,6 +41,7 @@ app = Flask(__name__)
 
 _task = {"running": False, "game": None, "video": None, "samples": None,
          "epochs": None, "batch": None, "out": None, "proc": None,
+         "test_size": None, "eval_only": False, "eval_repeats": 1,
          "log": None, "log_tail": "", "error": None,
          "started_at": None, "stage": "idle"}
 _lock = threading.Lock()
@@ -64,9 +66,19 @@ def health():
 
 @app.get("/has_ckpt")
 def has_ckpt():
-    """权重是否存在（本地 Web 据此跳过微调，仅重新评估）。"""
+    """权重是否存在 + 训练参数 meta（本地 Web 据此决定跳过微调或重训）。"""
     out = request.args.get("out", "").strip()
-    return jsonify({"ok": True, "data": {"exists": bool(out) and (OUT_DIR / Path(out).name).exists()}})
+    p = OUT_DIR / Path(out).name
+    exists = bool(out) and p.exists()
+    meta = None
+    if exists:
+        mp = Path(str(p) + ".meta.json")
+        if mp.exists():
+            try:
+                meta = json.loads(mp.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                meta = None
+    return jsonify({"ok": True, "data": {"exists": exists, "meta": meta}})
 
 
 @app.post("/eval_base")
@@ -138,6 +150,15 @@ def start():
         except ValueError:
             return jsonify({"ok": False, "error": "test_size 应为 10~5000 整数"}), 400
     eval_only = request.args.get("eval_only", "0").strip() in ("1", "true", "yes")
+    repeats_raw = request.args.get("eval_repeats", "").strip()
+    eval_repeats = 1
+    if repeats_raw:
+        try:
+            eval_repeats = int(repeats_raw)
+            if eval_repeats < 1 or eval_repeats > 5:
+                raise ValueError
+        except ValueError:
+            return jsonify({"ok": False, "error": "eval_repeats 应为 1~5 整数"}), 400
     if not (game and video and samples and out):
         return jsonify({"ok": False, "error": "参数 game/video/samples/out 必填"}), 400
     try:
@@ -155,16 +176,18 @@ def start():
             return jsonify({"ok": False, "error": "已有微调任务运行中"}), 409
         _task.update(running=True, game=game, video=video, samples=samples_i,
                      epochs=int(epochs), batch=int(batch), out=out, proc=None,
-                     test_size=test_size, eval_only=eval_only, log_tail="", error=None,
+                     test_size=test_size, eval_only=eval_only, eval_repeats=eval_repeats,
+                     log_tail="", error=None,
                      started_at=time.strftime("%H:%M:%S"), stage="finetuning")
     threading.Thread(target=_run, args=(game, video, samples_i, int(epochs),
-                                        int(batch), out, test_size, eval_only), daemon=True).start()
+                                        int(batch), out, test_size, eval_only,
+                                        eval_repeats), daemon=True).start()
     return jsonify({"ok": True, "data": {"status": "started", "out": out,
                                          "samples": samples_i}}), 202
 
 
 def _run(game: str, video: str, samples: int, epochs: int, batch: int, out: str,
-         test_size: int | None = None, eval_only: bool = False):
+         test_size: int | None = None, eval_only: bool = False, eval_repeats: int = 1):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     tag = out[:-3] if out.endswith(".pt") else out
     log = OUT_DIR / f"{out}.log"
@@ -192,21 +215,27 @@ def _run(game: str, video: str, samples: int, epochs: int, batch: int, out: str,
             if rc != 0:
                 raise RuntimeError(f"finetune 退出码 {rc}，日志: {log}")
         # 阶段 2：评估（A100 上 evaluate.py --ckpt --no-plots，产物 CSV 由 /metrics_csv 回传）
+        # eval_repeats>1 时用不同 --infer-seed 评估 N 次，产物 metrics_*_s{i}.csv 供均值±std 对照
         with _lock:
             _task["stage"] = "evaluating"
-        cmd = [str(BASE / ".venv" / "bin" / "python"), str(EVALUATE),
-               "--game", game, "--video", video, "--fps", "30",
-               "--ckpt", str(OUT_DIR / out), "--tag", tag, "--no-plots"]
-        if test_size:
-            cmd += ["--test-size", str(test_size)]
-        proc = subprocess.Popen(cmd, cwd=str(BASE),
-                                stdout=open(eval_log, "w", encoding="utf-8"),
-                                stderr=subprocess.STDOUT)
-        with _lock:
-            _task["proc"] = proc
-        rc = proc.wait()
-        if rc != 0:
-            raise RuntimeError(f"评估退出码 {rc}，日志: {eval_log}")
+        reps = max(1, eval_repeats)
+        for i in range(reps):
+            rtag = tag if reps == 1 else f"{tag}_s{i}"
+            log_i = OUT_DIR / f"{out}.eval{'%d' % i}.log" if reps > 1 else eval_log
+            cmd = [str(BASE / ".venv" / "bin" / "python"), str(EVALUATE),
+                   "--game", game, "--video", video, "--fps", "30",
+                   "--ckpt", str(OUT_DIR / out), "--tag", rtag, "--no-plots",
+                   "--infer-seed", str(i)]
+            if test_size:
+                cmd += ["--test-size", str(test_size)]
+            proc = subprocess.Popen(cmd, cwd=str(BASE),
+                                    stdout=open(log_i, "w", encoding="utf-8"),
+                                    stderr=subprocess.STDOUT)
+            with _lock:
+                _task["proc"] = proc
+            rc = proc.wait()
+            if rc != 0:
+                raise RuntimeError(f"评估退出码 {rc}（第 {i+1}/{reps} 次），日志: {log_i}")
         with _lock:
             _task.update(running=False, stage="done", proc=None)
     except Exception as e:  # noqa: BLE001
@@ -269,7 +298,10 @@ def logtail():
     except ValueError:
         lines = 60
     parts = []
-    for p in (OUT_DIR / f"{out}.log", OUT_DIR / f"{out}.eval.log"):
+    # 兼容 eval_repeats>1 时的 {out}.eval{i}.log（重复评估日志）
+    candidates = [OUT_DIR / f"{out}.log", OUT_DIR / f"{out}.eval.log"] + \
+        sorted(OUT_DIR.glob(f"{out}.eval[0-9].log"))
+    for p in candidates:
         if p.exists():
             parts.append(f"----- {p.name} -----")
             parts.extend(p.read_text(encoding="utf-8", errors="replace").splitlines())
