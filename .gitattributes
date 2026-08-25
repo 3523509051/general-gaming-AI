@@ -1,0 +1,3 @@
+# 强制 shell 脚本始终 LF（core.autocrlf=true 时 Windows 检出会转 CRLF，
+# 上传到 Linux 后 bash 会报 $'\r' 错误；此规则保证 .sh 在任意平台检出都是 LF）
+*.sh text eol=lf
