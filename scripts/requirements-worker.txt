@@ -1,0 +1,30 @@
+# 远程 GPU Worker 依赖清单（Linux + NVIDIA GPU 部署用）
+# 用法：由 scripts/setup_worker.sh 调用（pip install -r ... -i 清华源），也可手动：
+#   .venv/bin/pip install -r scripts/requirements-worker.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+#
+# 注意：
+# - torch / torchvision 不在此清单：CUDA 版本强依赖显卡架构，由 setup_worker.sh 用阿里云 pytorch-wheels 源按
+#   cu121/cu130 安装（A100 用 cu121，H100 用 cu130）。
+# - nitrogen 包来自官方仓库（pip install -e "NitroGen/.[serve]"），A100 访问不了 HuggingFace 时需离线带上
+#   siglip2 预处理缓存（config / preprocessor_config / model.safetensors）。
+# - transformers 必须锁 4.57.1（5.x 有 SiglipVisionModel 破坏性变更）。
+
+# --- 官方推理运行时 ---
+transformers==4.57.1
+diffusers==0.39.0
+einops==0.8.2
+huggingface_hub>=0.20.0
+safetensors>=0.4.0
+
+# --- 分析与数据 ---
+numpy==2.2.6
+polars==1.43.2
+pillow>=10.0.0
+pyarrow>=15.0.0
+
+# --- Worker 服务 ---
+flask>=3.0.0
+pydantic>=2.0.0          # nitrogen 包运行时依赖
+
+# --- 抽帧 ---
+imageio-ffmpeg>=0.4.0    # evaluate.py 抽帧用 ffmpeg 后端（远程评估构建测试集必需）

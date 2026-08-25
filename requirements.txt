@@ -23,6 +23,7 @@ pillow>=10.0.0
 
 # --- Web 平台后端 ---
 flask>=3.0.0
+paramiko>=3.0.0            # 远程后端 SSH/SFTP 数据自动上传（app.py remote_upload_data）
 
 # --- 视频下载与抽帧 ---
 yt-dlp>=2024.12.0          # 视频下载/探测（app.py download / probe_videos.py）
