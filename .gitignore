@@ -64,3 +64,7 @@ scripts/run_checks.py
 
 # --- 10. 报告插图（模块图等，随报告本地保留） ---
 assets/
+
+# --- 11. md 文件提交边界（除 README 外一律不入库；用户百分百指定时用 git add -f 强制） ---
+*.md
+!README.md
