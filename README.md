@@ -132,11 +132,16 @@ NitroGen\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
 ### 5. 下载预训练权重
 
+> **国内网络先设 HF 镜像**（直连 huggingface.co 慢/经常失败）：
+> ```powershell
+> $env:HF_ENDPOINT = "https://hf-mirror.com"   # 每个新终端执行一次
+> ```
+
 ```powershell
 NitroGen\.venv\Scripts\python.exe -c "from huggingface_hub import hf_hub_download; hf_hub_download('nvidia/NitroGen','ng.pt',local_dir=r'NitroGen')"
 ```
 
-首次推理会自动下载 SigLIP2-large 视觉编码器（约 3.4 GB，缓存在 `%USERPROFILE%\.cache\huggingface\hub`）。
+首次推理会自动下载 SigLIP2-large 视觉编码器（约 3.4 GB，缓存在 `%USERPROFILE%\.cache\huggingface\hub`）——**同样需要先设上面的 HF 镜像**，否则编码器下载会卡住。
 
 ### 6. 验证：跑通 ng.pt 推理（冒烟测试）
 
@@ -168,6 +173,7 @@ SMOKE TEST PASSED
 
 ```powershell
 # 例：下载 SHARD_0034（本课题已测的 hades / lies_of_p / star_fox_64 所在）
+# 国内网络先设 HF 镜像：$env:HF_ENDPOINT = "https://hf-mirror.com"
 NitroGen\.venv\Scripts\python.exe -c "from huggingface_hub import hf_hub_download; hf_hub_download('nvidia/NitroGen','actions/SHARD_0034.tar.gz',repo_type='dataset')"
 # 下载会落在 HF 缓存，必须复制到 data/shards/（scan_shard/extract_game 只在该目录找切片）：
 New-Item -ItemType Directory -Path data\shards -Force | Out-Null
@@ -215,6 +221,8 @@ NitroGen\.venv\Scripts\python.exe scripts\app.py   # 监听 http://localhost:500
   `Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -like "*app.py*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`
 
 ### 数据 / 评估命令行
+
+> **评估/微调抽帧依赖 ffmpeg**：本机由 `requirements.txt` 的 `imageio-ffmpeg` 提供（首次自动下载 ffmpeg 二进制，走 GitHub releases；国内网络若失败，请安装系统 ffmpeg 并加入 PATH，`evaluate.py` 会自动探测到）。
 
 ```powershell
 # 识别切片（生成 data/games_scan.json；默认自动定位 data/shards/ 中的切片）
@@ -274,9 +282,23 @@ NitroGen\.venv\Scripts\python.exe scripts\evaluate.py --game <game> --video <vid
 
 **原理**：`scripts/gpu_worker.py` 是微调专用远程服务（HTTP 接口，监听内网端口 56272），只做"微调 + 评估"，产物权重留远程、评估 CSV 回传本地（避免 2GB 权重来回传卡链路）。
 
-**一次性部署（A100 上，约 30~60 分钟）**：
-1. 上传到 `/root/workspace/nitrogen_worker/`：`scripts/`（finetune.py / evaluate.py / gpu_worker.py）+ `NitroGen/ng.pt`（1.97GB）+ `NitroGen/nitrogen/` 包 + 目标游戏视频 mp4 与 `data/<game>/` 标注 + **siglip2 预处理缓存**（A100 访问不了 HuggingFace，需离线带上 config / preprocessor_config / model.safetensors）；
-2. 装依赖（torch 用阿里云 pytorch-wheels 源、其余清华 pypi 源）：`torch`（按 CUDA 版本选 cu121/cu130）+ `transformers==4.57.1` + `polars` + `pillow` + `flask` + `pydantic` + `einops` + `diffusers` + `safetensors`；
+**一次性部署（A100 上，约 30~60 分钟，已提供自动化脚本）**：
+1. **拉仓库 + 自动安装**（`scripts/setup_worker.sh` 一步完成：建 venv、装 torch（阿里云源，cu121/cu130 可选）、装 `scripts/requirements-worker.txt` 依赖、生成 `start_worker.sh`）：
+   ```bash
+   git clone https://github.com/3523509051/general-gaming-AI.git /root/workspace/nitrogen_worker
+   cd /root/workspace/nitrogen_worker
+   bash scripts/setup_worker.sh /root/workspace/nitrogen_worker cu121   # A100=cu121，H100=cu130
+   ```
+2. **补齐仓库外资产**（setup 脚本会校验缺失并提示）：`NitroGen/ng.pt`（1.97GB，本机复制）→ `NitroGen/`（官方包，setup 自动 clone，**服务器访问不了 GitHub 时手动上传 `NitroGen/` 与 `scripts/` 即可，setup 会跳过 clone**）→ 目标游戏视频 mp4 与 `data/<game>/` 标注（本地自动上传或手动）→ **HF 离线缓存**（A100 访问不了 HuggingFace，需把本机 `~/.cache/huggingface/hub/` 下的 `models--google--siglip2-large-patch16-256` 与 `models--Qwen--Qwen3-1.7B` 两个目录整个复制到服务器同路径；实测模型加载需要这两个缓存）。
+
+   **本机 → 服务器传输示例**（本地 PowerShell，`<服务器IP>` 换成实际地址）：
+   ```powershell
+   # ng.pt 权重
+   scp -P 56271 NitroGen\ng.pt root@<服务器IP>:/root/workspace/nitrogen_worker/NitroGen/
+   # HF 离线缓存（两个目录各 1~3 GB，传一次即可）
+   scp -r -P 56271 "$env:USERPROFILE\.cache\huggingface\hub\models--google--siglip2-large-patch16-256" root@<服务器IP>:/root/.cache/huggingface/hub/
+   scp -r -P 56271 "$env:USERPROFILE\.cache\huggingface\hub\models--Qwen--Qwen3-1.7B" root@<服务器IP>:/root/.cache/huggingface/hub/
+   ```
 3. 启动服务并验证：
    ```bash
    cd /root/workspace/nitrogen_worker && chmod +x start_worker.sh
