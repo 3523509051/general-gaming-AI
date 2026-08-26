@@ -1,6 +1,6 @@
 # 通用游戏智能体：NitroGen 零样本评估与微调对照
 
-**本项目是一套面向通用游戏智能体的「零样本评估 + 微调对照」工具链。** 选定任意目标游戏视频，即可逐帧推理 NitroGen 基础模型输出的手柄操作（17 键 + 双摇杆），与人工标注真值对比，量化按键一致率、摇杆相关系数 / MSE 等指标；Web 平台可视化单帧识别、按键/摇杆统计分布与序列级差异；还可对官方预训练权重做小样本行为克隆微调，与零样本基线逐指标对照，实证回答"微调是否有效"。旨在验证通用视觉-动作基础模型在未见过的游戏上的零样本泛化能力，并为数据驱动的小样本适配提供可复现的定量评估与对照工具。
+**本项目是一套面向通用游戏智能体的「零样本评估 + 微调对照」工具链。** 选定任意目标游戏视频，即可逐帧推理 NitroGen 基础模型输出的手柄操作（17 键 + 双摇杆），与人工标注真值对比，量化按键一致率、摇杆相关系数 / MSE 等指标；Web 平台可视化单帧识别、按键/摇杆统计分布与序列级差异；还可对官方预训练权重做小样本行为克隆微调，与零样本基线逐指标对照，实证回答"微调是否有效"。推理 / 评估 / 微调可按需调度到本机 GPU 或远程 A100 服务器，**无独显的轻薄本也能通过远程转发完整使用全部功能**。旨在验证通用视觉-动作基础模型在未见过的游戏上的零样本泛化能力，并为数据驱动的小样本适配提供可复现的定量评估与对照工具。
 
 基于 NVIDIA **NitroGen** 开源视觉-动作基础模型（500M 参数 DiT，flow-matching 行为克隆，训练于 4 万小时 / 1000+ 游戏的手柄标注）的 zero-shot 推理、单游戏数据统计、定量评估与微调对照实践。
 
@@ -174,6 +174,36 @@ Copy-Item "$env:USERPROFILE\.cache\huggingface\hub\datasets--nvidia--NitroGen\sn
   NitroGen\.venv\Scripts\python.exe scripts\extract_game.py --game <game>
   ```
 - 已验证：`data/shards/` 中 SHARD_0000（86 游戏）、SHARD_0026（89 游戏）、SHARD_0034（89 游戏）独立清单分开显示；合并清单（games_scan.json，171 游戏）供 Web 下拉用，切片独立清单各存各的。
+
+### 8. 无 GPU（轻薄本）方案：全部推理 / 评估走远程 A100
+
+**适用**：本机无 NVIDIA GPU（轻薄本 / 核显本），但有远程 A100 服务器。本机只装轻量 Web 依赖即可启动，Tab① 单帧识别、评估、微调全部在远程执行，结果自动回传本地。
+
+**本机安装**（跳过 torch / ng.pt / HF 缓存三件套）：
+
+```powershell
+git clone <课题仓库> && cd general-gaming-AI
+python -m venv NitroGen\.venv
+NitroGen\.venv\Scripts\python.exe -m pip install --upgrade pip
+NitroGen\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+> **不需要**执行 `install_torch.ps1`、**不需要**下载 ng.pt 与 HF 模型缓存：Web 后端（`app.py`）顶层不 import torch，无 GPU 也能启动；单帧推理由 `/api/frame` 自动把帧图转发到远程 worker `/infer_frame`。
+
+**远程 A100 一次性部署**（完整装 torch + NitroGen + ng.pt + HF 缓存，见下方「扩展 A · 方案二」）。
+
+**本机对接**：Tab③「后端设置」选**远程服务器** → 填 `http://<服务器IP>:56272` + SSH 凭据 → 连接。此后单帧识别 / 评估 / 微调 / 统计 / 序列对比 / 对照表全走远程，CSV 与测试集自动回传。
+
+**有 GPU 本机 vs 无 GPU 本机 + 远程 A100 的差异**：
+
+| 维度 | 有 NVIDIA GPU 本机 | 无 GPU 轻薄本 + 远程 A100 |
+| --- | --- | --- |
+| torch / CUDA 安装 | 需要（install_torch.ps1） | 不需要 |
+| ng.pt 权重 / HF 模型缓存 | 本机需下载 | 本机不需要（远程已有） |
+| Tab① 单帧识别 | 本机推理（约 0.3s/帧） | 转发 A100 推理（含网络传输，略慢） |
+| 评估 / 微调 | 本机 GPU 执行 | A100 执行，CSV/测试集回传 |
+| 断点 / 并行 | 本机关闭任务即中断 | 远程任务不受本机关机影响，重开自动接管 |
+| 启动前提 | 本机即用 | 需远程 worker 在线 |
 
 ## 启动 / 停止
 
@@ -364,7 +394,7 @@ NitroGen\.venv\Scripts\python.exe scripts\evaluate.py --game <game> --video <vid
 | `/api/finetune/pull_weight/status` | 无 | 权重下载进度 |
 | `/api/prefs` | game, video, samples, epochs, batch, test_size, filter_idle, eval_repeats | 保存/恢复上次选择的游戏视频与微调参数 |
 
-**远程 worker 接口**（部署于服务器，端口 56272）：`/health`（GPU 信息+任务状态）、`/start`（启动微调+评估，含 eval_only/test_size/eval_repeats）、`/eval_base`（零样本基线评估）、`/has_ckpt`（权重存在性+训练参数 meta）、`/status`、`/cancel`、`/data_check`（视频/标注齐全性）、`/logtail`（日志尾部）、`/metrics_csv`、`/predictions_csv`、`/testset_csv`（评估产物回传：指标 / 逐帧预测 / 远程测试集）、`/download`（权重下载）。
+**远程 worker 接口**（部署于服务器，端口 56272）：`/health`（GPU 信息+任务状态）、`/start`（启动微调+评估，含 eval_only/test_size/eval_repeats）、`/eval_base`（零样本基线评估）、`/infer_frame`（单帧推理，base64 图片 POST，供无 GPU 本机 Tab① 转发）、`/has_ckpt`（权重存在性+训练参数 meta）、`/status`、`/cancel`、`/data_check`（视频/标注齐全性）、`/logtail`（日志尾部）、`/metrics_csv`、`/predictions_csv`、`/testset_csv`（评估产物回传：指标 / 逐帧预测 / 远程测试集）、`/download`（权重下载）。
 
 ### 安全说明
 

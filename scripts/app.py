@@ -359,6 +359,28 @@ def api_videos(game):
 
 # --------------------------------------------------------------------------
 # API 3: 单帧识别（核心）
+def _remote_infer_frame(url: str, game: str, video: str, frame: int, img_path: Path) -> dict:
+    """无本地 GPU 时把单帧推理转发到远程 worker /infer_frame（base64 图片 POST）。
+
+    返回与本地 Predictor.predict 相同的 dict：buttons/j_left/j_right（嵌套 list）。"""
+    import base64
+    import urllib.parse
+    import urllib.request
+    b64 = base64.b64encode(img_path.read_bytes()).decode("ascii")
+    body = urllib.parse.urlencode({
+        "game": game, "video": video, "frame": str(frame), "image_b64": b64,
+    }).encode("utf-8")
+    req = urllib.request.Request(url + "/infer_frame", data=body, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            j = json.load(r)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"远程推理失败（{url}）: {e}") from e
+    if not j.get("ok"):
+        raise RuntimeError(f"远程推理失败: {j.get('error')}")
+    return j["data"]
+
+
 # --------------------------------------------------------------------------
 @app.get("/api/frame")
 def api_frame():
@@ -399,7 +421,13 @@ def api_frame():
         if not img_path.exists():
             return err(f"帧画面缺失: {img_path.name}", 404)
         t0 = time.time()
-        result = Predictor.predict(Image.open(img_path))
+        # 单帧推理：远程后端模式且 worker 在线时转发到 A100（无本地 GPU 的轻薄本可用）；
+        # 否则本机 Predictor（需 NVIDIA GPU）
+        _ensure_backend_loaded()
+        if FT_BACKEND.get("mode") == "remote" and FT_BACKEND.get("remote_url"):
+            result = _remote_infer_frame(FT_BACKEND["remote_url"], game, video, frame, img_path)
+        else:
+            result = Predictor.predict(Image.open(img_path))
         inference_ms = int((time.time() - t0) * 1000)
 
         import numpy as np

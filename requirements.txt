@@ -6,6 +6,10 @@
 #   用 scripts/install_torch.ps1 或按兼容表手动安装）。
 # - transformers 必须锁 4.57.1（5.x 有 SiglipVisionModel 破坏性变更）。
 # - nitrogen 来自官方仓库，须先在 NitroGen/ 内执行 pip install -e ".[serve]"。
+#
+# 无 GPU（轻薄本 + 远程 A100）场景：仅安装本清单即可启动 Web，
+# 单帧识别 / 评估 / 微调全部走远程 worker（见 README "无 GPU 方案"）——
+# 不需要 torch、不需要下载 ng.pt 与 HF 模型缓存（app.py 顶层不 import torch）。
 
 # --- 官方推理运行时 ---
 diffusers==0.39.0

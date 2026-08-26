@@ -46,6 +46,10 @@ _task = {"running": False, "game": None, "video": None, "samples": None,
          "started_at": None, "stage": "idle"}
 _lock = threading.Lock()
 
+# 单帧推理会话（/infer_frame 用）：进程内懒加载 ng.pt，与评估子进程互不干扰
+_infer_session = None
+_infer_lock = threading.Lock()
+
 
 def _gpu_info() -> dict:
     try:
@@ -369,6 +373,56 @@ def testset_csv():
         if cand.exists():
             return Response(cand.read_text(encoding="utf-8"), mimetype="text/csv")
     return jsonify({"ok": False, "error": f"远程无测试集 {game}/{video}"}), 404
+
+
+def _get_infer_session():
+    """懒加载远程单帧推理会话（NitroGen InferenceSession 进程内单例）。"""
+    global _infer_session
+    if _infer_session is None:
+        import builtins
+        import os
+        import sys as _sys
+        builtins.input = lambda *a: ""  # 无条件模式
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        # 与 evaluate.py 一致：worker 的 NitroGen 目录为源码拷贝（非 pip install -e），
+        # 需手动把 nitrogen 包目录加入 sys.path
+        if str(BASE / "NitroGen") not in _sys.path:
+            _sys.path.insert(0, str(BASE / "NitroGen"))
+        from nitrogen.inference_session import InferenceSession
+        ckpt = BASE / "NitroGen" / "ng.pt"
+        if not ckpt.exists():
+            raise RuntimeError(f"远程无权重 {ckpt}")
+        _infer_session = InferenceSession.from_ckpt(str(ckpt))
+    return _infer_session
+
+
+@app.post("/infer_frame")
+def infer_frame():
+    """远程单帧推理：本机无 GPU 时由本地 /api/frame 转发（base64 图片，POST form）。
+    与评估/微调子进程互不干扰（独立锁 + 进程内会话）。"""
+    game = request.values.get("game", "").strip()
+    video = request.values.get("video", "").strip()
+    image_b64 = request.values.get("image_b64", "").strip()
+    if not image_b64:
+        return jsonify({"ok": False, "error": "缺少 image_b64"}), 400
+    import base64
+    import io
+    from PIL import Image
+    try:
+        img = Image.open(io.BytesIO(base64.b64decode(image_b64)))
+        with _infer_lock:
+            result = _get_infer_session().predict(img)
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"ok": False, "error": f"远程推理失败: {e}"}), 500
+
+    def _to_list(x):
+        return x.tolist() if hasattr(x, "tolist") else x
+
+    return jsonify({"ok": True, "data": {
+        "buttons": _to_list(result["buttons"]),   # (18, 21)
+        "j_left": _to_list(result["j_left"]),     # (18, 2)
+        "j_right": _to_list(result["j_right"]),   # (18, 2)
+    }})
 
 
 @app.get("/download")
