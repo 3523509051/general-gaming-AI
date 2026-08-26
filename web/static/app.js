@@ -61,9 +61,6 @@ window.addEventListener("DOMContentLoaded", async () => {
   await loadGames();
   setupShardDropzone();   // 初始化切片拖拽导入
   initBackendHeader();    // 顶部后端状态（评估/分析 + 微调共用）
-  // 指标条帧数输入：用户手动改过就标记，避免被当前帧数覆盖
-  const tsi = document.getElementById("testSizeInput2");
-  if (tsi) tsi.addEventListener("input", () => { tsi.dataset.userEdited = "1"; });
   // 若后台仍有探测/下载任务在跑，恢复进度轮询
   try {
     const st = await api("/api/rescan/status");
@@ -112,11 +109,9 @@ function savePrefs() {
   if (eInp) p.set("epochs", eInp.value || "");
   if (bInp) p.set("batch", bInp.value || "");
   if (tInp) p.set("test_size", tInp.value || "");
-  // 过滤 IDLE / 评估次数：指标条控件优先（存在时以它为准），否则用微调面板
-  const mfInp = document.getElementById("metricsFilterIdle");
-  const mrInp = document.getElementById("metricsRepeatsInput");
-  p.set("filter_idle", mfInp ? (mfInp.checked ? "1" : "") : (fInp && fInp.checked ? "1" : ""));
-  p.set("eval_repeats", mrInp ? (mrInp.value || "") : (rInp ? rInp.value : ""));
+  // 过滤 IDLE / 评估次数：读取微调面板
+  p.set("filter_idle", fInp && fInp.checked ? "1" : "");
+  p.set("eval_repeats", rInp ? (rInp.value || "") : "");
   fetch(`/api/prefs?${p}`, { method: "POST" }).catch(() => {});
 }
 
@@ -219,10 +214,16 @@ async function onVideoChange(video) {
   // 加载测试集帧列表
   try {
     const d = await api(`/api/testset?game=${encodeURIComponent(state.game)}&video=${encodeURIComponent(video)}`);
-    state.frames = d.frames;
+    state.frames = d.frames || [];
     const slider = document.getElementById("frameSlider");
-    slider.max = Math.max(0, d.frames.length - 1);
-    if (d.frames.length) await selectFrame(0);
+    slider.max = Math.max(0, state.frames.length - 1);
+    if (state.frames.length) {
+      await selectFrame(0);
+    } else {
+      // 测试集为空：在 Tab① 显示完整评估入口（帧数/过滤IDLE/次数/运行按钮）
+      renderEvalGuideT1();
+      setLineage(`${state.game} / ${video}（无测试集，请先运行评估）`, "warn");
+    }
   } catch (e) {
     setLineage(`${state.game} / ${video}（无测试集，请先运行评估脚本）`, "warn");
     showError(e.message);
@@ -237,8 +238,8 @@ async function loadMetricsBanner() {
   try {
     // 跟随当前 shift 选择器（auto=最优；具体 k 则实时返回该步指标）
     const shift = (document.getElementById("shiftSelect") || {}).value || "auto";
-    // 过滤 IDLE 口径切换：勾选后 /api/metrics 返回非 IDLE 帧的按键一致率
-    const fidleEl = document.getElementById("metricsFilterIdle");
+    // 过滤 IDLE 口径切换（Tab① 评估入口勾选 → 指标条按非 IDLE 口径显示）
+    const fidleEl = document.getElementById("evalFilterIdle");
     const fidle = !!(fidleEl && fidleEl.checked);
     const d = await api(`/api/metrics?game=${encodeURIComponent(state.game)}&video=${encodeURIComponent(state.video)}&shift=${shift}&filter_idle=${fidle ? "1" : "0"}`);
     banner.classList.remove("hidden");
@@ -246,12 +247,6 @@ async function loadMetricsBanner() {
     const nFrames = (fidle && d.n_frames_nonidle != null) ? `${d.n_frames_nonidle}(非IDLE)` : (d.metrics.test_frames ?? d.test_frames);
     document.getElementById("metricsScope").textContent =
       `${d.game} / ${d.video} · ${nFrames} 帧 · ${shiftLabel}${fidle ? " · 过滤IDLE口径" : ""}`;
-    // 同步"重新评估"帧数输入框的当前值（便于改帧数后重跑）
-    const tsi = document.getElementById("testSizeInput2");
-    if (tsi) {
-      const cur = d.metrics.test_frames ?? d.test_frames;
-      if (cur && !tsi.dataset.userEdited) tsi.value = cur;
-    }
     const m = d.metrics, ref = d.reference, v = d.verdicts;
     const chips = [
       { label: fidle ? "按键一致率(非IDLE逐帧全对)" : "按键一致率(逐帧全对)", value: (m.acc_17keys * 100).toFixed(1) + "%",
@@ -730,15 +725,17 @@ async function loadSequences() {
   }
 }
 
-function renderEvalGuide() {
-  const box = document.getElementById("seqChart");
+// Tab① 未评估时的完整评估入口（帧数/过滤IDLE/评估次数/运行按钮）
+function renderEvalGuideT1() {
+  const box = document.getElementById("gamepad");
+  if (!box) return;
   const cur = state.videos.find(v => v.video === state.video);
   const downloaded = cur && cur.status === "downloaded";
   box.innerHTML = `
     <div class="eval-guide">
       <div class="eval-guide-icon">🧪</div>
       <div class="eval-guide-body">
-        <h4>该视频尚未评估，序列对比需要评估产物（predictions.csv）</h4>
+        <h4>该视频尚未评估，单帧识别需要测试集帧列表（test_set CSV）</h4>
         <p>评估流程：抽测试集帧 → 加载 NitroGen 模型逐帧推理 → shift 扫描对齐 → 生成对比数据并入库。
            预计耗时 3~6 分钟（含模型加载），后台运行。</p>
         <div class="eval-guide-form">
@@ -754,7 +751,7 @@ function renderEvalGuide() {
         </div>
         ${downloaded ? `
           <p class="eval-guide-warn">前置条件已满足（视频已下载）。</p>
-          <button class="primary-btn" onclick="triggerEvaluate()">运行评估（约 3~6 分钟）</button>`
+          <button class="primary-btn" onclick="triggerEvaluateFromMetrics()">运行评估（约 3~6 分钟）</button>`
         : `
           <p class="eval-guide-warn">⚠ 前置条件：视频尚未下载，评估需要本地视频文件。
              请先在顶部栏点「⬇ 下载视频」下载后再回来评估。</p>`}
@@ -762,42 +759,28 @@ function renderEvalGuide() {
     </div>`;
 }
 
-async function triggerEvaluate() {
-  if (!state.game || !state.video) return;
-  try {
-    // 读取前端帧数输入（默认 200；留空则后端用默认）
-    const inp = document.getElementById("testSizeInput");
-    const testSize = inp ? inp.value.trim() : "";
-    const params = [`game=${encodeURIComponent(state.game)}`, `video=${encodeURIComponent(state.video)}`];
-    if (testSize) params.push(`test_size=${encodeURIComponent(testSize)}`);
-    const fidle = document.getElementById("evalFilterIdle") && document.getElementById("evalFilterIdle").checked;
-    const rpInp = document.getElementById("evalRepeatsInput");
-    const rp = rpInp ? rpInp.value.trim() : "";
-    if (fidle) params.push("filter_idle=1");
-    if (rp && parseInt(rp, 10) > 1) params.push(`eval_repeats=${encodeURIComponent(rp)}`);
-    if (testSize) localStorage.setItem("evalTestSize", testSize);
-    const r = await fetch(`/api/evaluate?${params.join("&")}`, { method: "POST" });
-    const j = await r.json();
-    if (!j.ok) { showError(j.error || "评估启动失败"); return; }
-    document.getElementById("seqChart").innerHTML =
-      `<div class="loading-block"><div class="spinner"></div>评估已启动，正在后台运行…</div>`;
-    showEvalLog(true);
-    pollEvaluate();
-  } catch (e) { showError("评估启动失败: " + e.message); }
+// Tab③ 未评估时的极简占位（评估入口已移到 Tab①，这里不保留评估表单）
+function renderEvalGuide() {
+  const box = document.getElementById("seqChart");
+  box.innerHTML = `
+    <div class="loading-block">
+      <div class="mt">该视频尚未评估，暂无序列对比数据。<br>请先在 Tab① 运行评估后再回来查看。</div>
+    </div>`;
 }
 
-// 指标条"重新评估"：读取帧数/过滤IDLE/评估次数并启动（已评估/未评估均可）
+// 顶部固定/指标条"运行评估"：读取帧数/过滤IDLE/评估次数并启动（已评估/未评估均可）
+// 评估启动：读取 Tab① 评估入口的帧数/过滤IDLE/评估次数（未渲染时用默认）
 async function triggerEvaluateFromMetrics() {
   if (!state.game || !state.video) { showError("请先选择游戏和视频"); return; }
-  const inp = document.getElementById("testSizeInput2");
+  const inp = document.getElementById("testSizeInput");
   const val = inp ? inp.value.trim() : "";
-  const n = parseInt(val, 10);
-  if (!n || n < 10 || n > 5000) { showError("测试集帧数应在 10~5000 之间"); return; }
+  const n = parseInt(val, 10) || 200;   // 无输入时默认 200
+  if (n < 10 || n > 5000) { showError("测试集帧数应在 10~5000 之间"); return; }
   if (inp) inp.dataset.userEdited = "1";
-  // 过滤 IDLE / 评估次数：优先读指标条控件，未渲染时回退到评估引导控件
-  const fidleEl = document.getElementById("metricsFilterIdle") || document.getElementById("evalFilterIdle");
+  // 过滤 IDLE / 评估次数：读取 Tab① 评估入口控件
+  const fidleEl = document.getElementById("evalFilterIdle");
   const fidle = !!(fidleEl && fidleEl.checked);
-  const rpInp = document.getElementById("metricsRepeatsInput") || document.getElementById("evalRepeatsInput");
+  const rpInp = document.getElementById("evalRepeatsInput");
   const rp = rpInp ? rpInp.value.trim() : "";
   if (rp && (!parseInt(rp, 10) || parseInt(rp, 10) < 1 || parseInt(rp, 10) > 5)) { showError("评估次数应在 1~5 之间"); return; }
   const params = [`game=${encodeURIComponent(state.game)}`, `video=${encodeURIComponent(state.video)}`, `test_size=${n}`];
@@ -904,12 +887,18 @@ async function initBackendHeader() {
   updateBackendHeader();
 }
 
+function setBkMode(mode) {
+  // 后端 tab 切换：只切换显示，不保存（点「保存并连接」才落库）
+  document.querySelectorAll("#bkModeTabs .bk-mode-btn").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.mode === mode);
+  });
+  const rf = document.getElementById("bkRemoteFields");
+  if (rf) rf.style.display = mode === "remote" ? "block" : "none";
+}
+
 function openBackendModal() {
   const b = FT_BACKEND_STATE || {};
-  const m = document.getElementById("bkMode");
-  if (m) m.value = b.mode || "local";
-  const rf = document.getElementById("bkRemoteFields");
-  if (rf) rf.style.display = b.mode === "remote" ? "block" : "none";
+  setBkMode(b.mode || "local");
   const u = document.getElementById("bkUrl"); if (u) u.value = b.remote_url || "";
   const su = document.getElementById("bkSshUser"); if (su) su.value = (b.ssh && b.ssh.user) || "";
   const sp = document.getElementById("bkSshPort"); if (sp) sp.value = (b.ssh && b.ssh.port) || "";
@@ -930,7 +919,9 @@ function closeBackendModal() {
 }
 
 async function saveBackendHeader() {
-  const mode = document.getElementById("bkMode").value;
+  // 从 tab 按钮读取当前选择（没有 tab 时回退旧下拉兼容）
+  const tab = document.querySelector("#bkModeTabs .bk-mode-btn.active");
+  const mode = tab ? tab.dataset.mode : ((document.getElementById("bkMode") || {}).value || "local");
   const url = document.getElementById("bkUrl").value.trim();
   const user = document.getElementById("bkSshUser").value.trim();
   const port = document.getElementById("bkSshPort").value.trim();
@@ -1068,11 +1059,6 @@ function renderFinetunePanel() {
     if (tInp && prefs.test_size) tInp.value = prefs.test_size;
     if (fInp && prefs.filter_idle === "1") fInp.checked = true;
     if (rInp && prefs.eval_repeats) rInp.value = prefs.eval_repeats;
-    // 同步到指标条控件（刷新后仍保持上次勾选/次数）
-    const mfInp = document.getElementById("metricsFilterIdle");
-    const mrInp = document.getElementById("metricsRepeatsInput");
-    if (mfInp && prefs.filter_idle === "1") mfInp.checked = true;
-    if (mrInp && prefs.eval_repeats) mrInp.value = prefs.eval_repeats;
   }).catch(() => {});
 }
 

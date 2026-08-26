@@ -62,20 +62,18 @@
 <div id="backendModal" class="modal hidden">
   <div class="modal-box">
     <h3>计算后端配置</h3>
-    <p class="modal-note">评估（分析）与微调都在所选后端运行：远程后端（A100）无需本机显卡；本机后端用当前电脑 GPU。<br>下方地址/账号为回填你<b>本机已保存的配置</b>（data/remote_worker.json，该目录被 .gitignore 保护，<b>不入库、不提交</b>）；SSH 密码<b>始终不回填</b>，留空表示不修改。</p>
+    <p class="modal-note">评估（分析）与微调都在所选后端运行：远程后端（A100）无需本机显卡；本机后端用当前电脑 GPU。<br>下方地址/账号为回填你<b>本机已保存的配置</b>（data/remote_worker.json，该目录被 .gitignore 保护，<b>不入库、不提交</b>）；SSH 密码<b>始终不回填</b>，首次填写后留空即沿用已存密码。<br><b>保存并连接</b>会用 SSH 密码真实登录验证，密码错误或连不上会报错且不保存。</p>
     <div class="backend-form">
-      <div style="margin:10px 0">
-        <label>后端：</label>
-        <select id="bkMode" onchange="document.getElementById('bkRemoteFields').style.display=this.value==='remote'?'block':'none'">
-          <option value="local">本机（当前电脑 GPU）</option>
-          <option value="remote">远程服务器（A100）</option>
-        </select>
+      <div class="bk-mode-tabs" id="bkModeTabs">
+        <button type="button" class="bk-mode-btn" data-mode="local" onclick="setBkMode('local')">🖥 本机 GPU（当前电脑）</button>
+        <button type="button" class="bk-mode-btn" data-mode="remote" onclick="setBkMode('remote')">☁ 远程服务器（A100）</button>
       </div>
-      <div id="bkRemoteFields" style="display:none;margin:6px 0">
+      <div id="bkRemoteFields" style="display:none;margin:8px 0">
         <label>服务器地址：<input id="bkUrl" type="text" placeholder="http://服务器IP:端口" style="width:220px"></label><br>
         <label>SSH 账号：<input id="bkSshUser" type="text" placeholder="服务器用户名" style="width:140px"></label>
         <label>SSH 端口：<input id="bkSshPort" type="text" placeholder="SSH端口" style="width:80px"></label><br>
-        <label>SSH 密码：<input id="bkSshPwd" type="password" placeholder="留空=不修改" style="width:200px"></label>
+        <label>SSH 密码：<input id="bkSshPwd" type="password" placeholder="必填；保存时会验证连接" style="width:200px"></label><br>
+        <span class="muted" style="font-size:12px">保存并连接时会用该密码真实登录测试，失败则报错不保存；首次填一次，之后留空沿用已存密码。</span>
       </div>
       <div id="bkStatus" class="muted"></div>
     </div>
@@ -100,14 +98,8 @@
     <span class="metrics-title">📊 零样本评估指标</span>
     <span id="metricsScope" class="metrics-scope"></span>
     <span class="metrics-resize">
-      <label for="testSizeInput2">测试集帧数</label>
-      <input id="testSizeInput2" type="number" min="10" max="5000" step="10" value="200">
-      <label class="metrics-check" title="评估时额外生成过滤 IDLE 口径（仅非 IDLE 帧统计），指标条可切换显示">
-        <input id="metricsFilterIdle" type="checkbox" onchange="loadMetricsBanner()"> 过滤IDLE帧
-      </label>
-      <label for="metricsRepeatsInput" title=">1 时用不同推理 seed 评估 N 次，对照表显示均值±std，判断差异是真实还是采样噪声">评估次数</label>
-      <input id="metricsRepeatsInput" type="number" min="1" max="5" step="1" value="1" style="width:52px">
-      <button class="primary-btn" onclick="triggerEvaluateFromMetrics()">重新评估</button>
+      <button class="primary-btn" onclick="triggerEvaluateFromMetrics()">🔄 重新评估</button>
+      <span class="muted" style="font-size:12px">帧数/过滤IDLE/次数在顶部工具栏配置</span>
     </span>
   </div>
   <div id="metricsChips" class="metrics-chips"></div>

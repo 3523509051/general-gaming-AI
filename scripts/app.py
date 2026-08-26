@@ -1725,6 +1725,33 @@ def remote_data_check(url: str, game: str, video: str) -> list[str]:
         return ["video", "manifest", "annotations"]
 
 
+def test_ssh_connection(ssh_cfg: dict) -> str:
+    """用 paramiko 真实连接一次远程 SSH，验证 host/user/port/password 是否有效。
+    成功返回 ""；失败返回可读错误信息。"""
+    import paramiko
+    host = ssh_cfg.get("host")
+    port = int(ssh_cfg.get("port", 22))
+    user = ssh_cfg.get("user", "root")
+    pwd = ssh_cfg.get("password", "")
+    if not host:
+        return "SSH 未配置 host（请填写服务器地址）"
+    if not pwd:
+        return "未填写 SSH 密码（SSH 密码不能为空）"
+    try:
+        c = paramiko.SSHClient()
+        c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        c.connect(host, port=port, username=user, password=pwd, timeout=10)
+        c.close()
+        return ""
+    except Exception as e:  # noqa: BLE001
+        msg = str(e)
+        if "Authentication failed" in msg or "Permission denied" in msg:
+            return f"SSH 登录失败：账号或密码错误（{user}@{host}:{port}）"
+        if "timed out" in msg or "Connection refused" in msg or "Unable to connect" in msg:
+            return f"SSH 无法连接 {host}:{port}（网络或端口不通，检查端口是否开放）"
+        return f"SSH 连接失败: {msg}"
+
+
 def remote_upload_data(ssh_cfg: dict, game: str, video: str, log_fn=None) -> int:
     """SFTP 自动上传该游戏数据（视频+manifest+annotations）到远程，返回总字节数。"""
     import paramiko
@@ -2095,6 +2122,10 @@ def api_finetune_backend_set():
             ssh.setdefault("host", host)
         ssh.setdefault("port", "56271")
         ssh.setdefault("user", "root")
+        # 保存时真实 SSH 连接测试：密码错误/连不上直接报错，不保存
+        err_ssh = test_ssh_connection(ssh)
+        if err_ssh:
+            return err(err_ssh, 400)
     FT_BACKEND["mode"] = mode
     FT_BACKEND["remote_url"] = url
     FT_BACKEND["ssh"] = ssh if mode == "remote" else {}
