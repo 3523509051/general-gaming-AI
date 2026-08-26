@@ -25,6 +25,7 @@ import csv
 import json
 import math
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -92,6 +93,8 @@ def load_json(path: Path, default=None):
 
 def downloaded_videos(game: str) -> list[str]:
     """该游戏已下载的视频 ID（data/videos/{game}_{video}.mp4）。"""
+    if not _NAME_RE.match(game or ""):  # 防 glob 通配/路径穿越
+        return []
     return [p.stem[len(game) + 1:]
             for p in (DATA_ROOT / "videos").glob(f"{game}_*.mp4")]
 
@@ -99,8 +102,23 @@ def downloaded_videos(game: str) -> list[str]:
 # --------------------------------------------------------------------------
 # 数据缓存（进程内，重启失效；标注 parquet 用 polars 惰性加载）
 # --------------------------------------------------------------------------
+# 安全名白名单：Unicode 字母/数字/下划线/连字符（\w 兼容 HF 数据集游戏名中的口音字符 é/ö 等），
+# 且不含 . / \ 等路径穿越字符，防穿越性质不变。
+_NAME_RE = re.compile(r"^[\w\-]+$")
+
+
+def _safe_name(name: str, field: str = "参数") -> str:
+    """外部输入安全名校验：只允许 Unicode 字母/数字/下划线/连字符，防止路径穿越。"""
+    if not _NAME_RE.match(name or ""):
+        raise LineageError(f"{field} 含非法字符（仅允许字母/数字/下划线/连字符）: {name!r}")
+    return name
+
+
 @lru_cache(maxsize=8)
 def get_manifest(game: str) -> dict | None:
+    # 非法 game 名视为无 manifest（安全失败，避免 DATA_ROOT / game 路径穿越）
+    if not _NAME_RE.match(game or ""):
+        return None
     p = DATA_ROOT / game / "manifest.json"
     return load_json(p) if p.exists() else None
 
@@ -203,11 +221,14 @@ def handle_lineage_error(e):
 def assert_lineage(game: str, video: str, frame: int | None = None):
     """三方一致断言，失败抛 LineageError。
 
+    - 入口先做外部输入安全名校验（防路径穿越）
     - manifest：video 必须属于该 game
     - test_set：请求帧必须在该 video 的测试集内
     - annotations：该帧必须能关联到标注真值
     成功且 frame 不为 None 时返回 (test_row, gt_dict)。
     """
+    _safe_name(game, "game")
+    _safe_name(video, "video")
     manifest = get_manifest(game)
     if manifest is None:
         raise LineageError(
@@ -2328,6 +2349,11 @@ def api_download():
     video = request.args.get("video", "").strip()
     if not game or not video:
         return err("参数 game/video 必填")
+    try:
+        _safe_name(game, "game")
+        _safe_name(video, "video")
+    except LineageError as e:
+        return err(str(e), 400)
     out = DATA_ROOT / "videos" / f"{game}_{video}.mp4"
     if out.exists():
         return ok({"status": "exists", "game": game, "video": video})

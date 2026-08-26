@@ -362,6 +362,13 @@ NitroGen\.venv\Scripts\python.exe scripts\evaluate.py --game <game> --video <vid
 
 **远程 worker 接口**（部署于服务器，端口 56272）：`/health`（GPU 信息+任务状态）、`/start`（启动微调+评估，含 eval_only/test_size/eval_repeats）、`/eval_base`（零样本基线评估）、`/has_ckpt`（权重存在性+训练参数 meta）、`/status`、`/cancel`、`/data_check`（视频/标注齐全性）、`/logtail`（日志尾部）、`/metrics_csv`、`/predictions_csv`（评估结果回传）、`/download`（权重下载）。
 
+### 安全说明
+
+- **外部输入校验**：所有查询参数在服务端校验——`game`/`video` 使用安全名白名单（仅 Unicode 字母/数字/下划线/连字符，兼容 HF 数据集游戏名中的口音字符如 é/ö，且不含 `.`/`/`/`\` 等路径穿越字符，见 `scripts/app.py` 的 `_safe_name`）；数值参数（samples/epochs/batch/test_size/eval_repeats/frame/shift 等）均有类型与范围校验。
+- **凭据不入库**：远程后端 SSH 凭据只存本地 `data/remote_worker.json`（该目录被 `.gitignore` 覆盖），代码与仓库不含真实密码或令牌。
+- **防注入**：SQL 全部参数化执行（`execute(sql, params)`）；系统命令一律以参数列表方式调用（无 shell 拼接）。
+- **鉴权**：本工具为本地单用户应用（localhost:5000），无账号体系；远程 worker 仅监听校园网受限端口，不对外暴露服务。
+
 ## 必要环境变量
 
 | 变量 | 作用 | 说明 |
