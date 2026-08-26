@@ -1409,20 +1409,79 @@ def _run_evaluate_remote(game: str, video: str, test_size: int | None, remote_ur
             if src.exists():
                 shutil.copy(src, dst)
                 _log(f"{dst.name} 已更新为主副本（{src.name}）")
-        # 6) 回传测试集：远程评估按 --test-size 构建的 test_set_<video>.csv，
-        #    不同步会导致本地帧浏览（/api/testset）与 1000 帧评估口径不一致；
+        # 6) 回传测试集 + 帧图：远程评估按 --test-size 构建的 test_set_<video>.csv 与
+        #    test_frames/*.jpg 若不回传，本地 Tab① 帧浏览会报"帧画面缺失"；
         #    拉取失败不阻塞完成（前端回退旧测试集）
         try:
             import urllib.parse as _up
             import urllib.request as _ur
             (DATA_ROOT / game).mkdir(parents=True, exist_ok=True)
             qs = _up.urlencode({"game": game, "video": video})
+            test_csv_path = DATA_ROOT / game / f"test_set_{video}.csv"
             with _ur.urlopen(f"{remote_url}/testset_csv?{qs}", timeout=30) as _r:
-                (DATA_ROOT / game / f"test_set_{video}.csv").write_text(
-                    _r.read().decode("utf-8"), encoding="utf-8")
+                test_csv_path.write_text(_r.read().decode("utf-8"), encoding="utf-8")
             _log(f"test_set_{video}.csv 已回传（远程测试集，{test_size or 200} 帧口径）")
+            # 批量拉取测试集帧图（仅拉缺失的，避免重复下载）
+            frame_dir = DATA_ROOT / game / "test_frames"
+            frame_dir.mkdir(parents=True, exist_ok=True)
+            _missing = 0
+            for r in csv.DictReader(open(test_csv_path, encoding="utf-8")):
+                fname = Path(r.get("frame_path", "")).name
+                if not fname:
+                    continue
+                local_p = frame_dir / fname
+                if local_p.exists() and local_p.stat().st_size > 0:
+                    continue
+                try:
+                    fqs = _up.urlencode({"game": game, "name": fname})
+                    with _ur.urlopen(f"{remote_url}/frame_img?{fqs}", timeout=30) as fr:
+                        local_p.write_bytes(fr.read())
+                except Exception:  # noqa: BLE001
+                    _missing += 1
+            _log(f"测试集帧图已回传（新增 {len(list(frame_dir.glob(f'{video}_*.jpg')))} 张，缺失 {_missing} 张）")
         except Exception as e:  # noqa: BLE001
-            _log(f"测试集回传失败（忽略）: {str(e)[:150]}")
+            _log(f"测试集/帧图回传失败（忽略）: {str(e)[:150]}")
+        # 7) 本地 DB 同步：远程评估的 save_to_db 写的是远程 DB，本地 eval_results.db
+        #    无该视频记录会导致 /api/metrics 404（指标条不显示）。从回传的
+        #    metrics_<video>.csv 重建本地记录（与 evaluate.py save_to_db 口径一致）。
+        try:
+            metrics_csv = eval_dir / f"metrics_{video}.csv"
+            if metrics_csv.exists():
+                mrows = [r for r in csv.DictReader(open(metrics_csv, encoding="utf-8"))
+                         if r.get("acc_17keys_all") not in (None, "", "nan")]
+                if mrows:
+                    best_m = max(mrows, key=lambda m: float(m["acc_17keys_all"]))
+                    conn = sqlite3.connect(REPO / "data" / "eval_results.db")
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS eval_results (
+                          game TEXT NOT NULL, video TEXT NOT NULL,
+                          stats_frames INTEGER, test_frames INTEGER,
+                          acc_17keys REAL, recall REAL, precision REAL,
+                          corr_jl_x REAL, corr_jl_y REAL, mse_jl REAL, best_shift INTEGER,
+                          stats_plot TEXT, seq_plot TEXT, shift_scan TEXT, test_set_csv TEXT,
+                          PRIMARY KEY (game, video)
+                        )
+                    """)
+                    conn.execute("""
+                        INSERT OR REPLACE INTO eval_results
+                          (game, video, stats_frames, test_frames, acc_17keys, recall, precision,
+                           corr_jl_x, corr_jl_y, mse_jl, best_shift, test_set_csv)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, (game, video, int(float(best_m.get("n_frames", 0) or 0)),
+                          int(float(best_m.get("n_frames", 0) or 0)),
+                          float(best_m["acc_17keys_all"]),
+                          float(best_m.get("btn_recall", 0) or 0),
+                          float(best_m.get("btn_precision", 0) or 0),
+                          float(best_m.get("corr_jl_x", 0) or 0),
+                          float(best_m.get("corr_jl_y", 0) or 0),
+                          float(best_m.get("mse_jl_x", 0) or 0),
+                          int(float(best_m["shift"])),
+                          f"data/{game}/test_set_{video}.csv"))
+                    conn.commit()
+                    conn.close()
+                    _log(f"本地 DB 已同步（{game}/{video} acc={float(best_m['acc_17keys_all']):.4f} shift={best_m['shift']}）")
+        except Exception as e:  # noqa: BLE001
+            _log(f"本地 DB 同步失败（忽略）: {str(e)[:150]}")
         _log("评估结果已回传")
         clear_cache(game)
         with _eval_lock:

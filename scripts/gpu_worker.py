@@ -375,6 +375,22 @@ def testset_csv():
     return jsonify({"ok": False, "error": f"远程无测试集 {game}/{video}"}), 404
 
 
+@app.get("/frame_img")
+def frame_img():
+    """回传单张测试集帧图（远程评估抽帧产物），供本地 Tab① 帧浏览使用。
+    参数：game、name（如 v1865975542_f00018.jpg）。"""
+    game = request.args.get("game", "").strip()
+    name = request.args.get("name", "").strip()
+    if not game or not name:
+        return jsonify({"ok": False, "error": "参数 game/name 必填"}), 400
+    if "/" in name or "\\" in name or ".." in name:
+        return jsonify({"ok": False, "error": "非法文件名"}), 400
+    p = DATA / game / "test_frames" / name
+    if not p.exists():
+        return jsonify({"ok": False, "error": f"远程无帧图 {name}"}), 404
+    return send_file(p, mimetype="image/jpeg")
+
+
 def _get_infer_session():
     """懒加载远程单帧推理会话（NitroGen InferenceSession 进程内单例）。"""
     global _infer_session

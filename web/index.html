@@ -98,8 +98,14 @@
     <span class="metrics-title">📊 零样本评估指标</span>
     <span id="metricsScope" class="metrics-scope"></span>
     <span class="metrics-resize">
+      <label for="testSizeInput2">测试集帧数</label>
+      <input id="testSizeInput2" type="number" min="10" max="5000" step="10" value="200">
+      <label class="metrics-check" title="评估时额外生成过滤 IDLE 口径（仅非 IDLE 帧统计），指标条可切换显示">
+        <input id="metricsFilterIdle" type="checkbox" onchange="loadMetricsBanner()"> 过滤IDLE帧
+      </label>
+      <label for="metricsRepeatsInput" title=">1 时用不同推理 seed 评估 N 次，对照表显示均值±std，判断差异是真实还是采样噪声">评估次数</label>
+      <input id="metricsRepeatsInput" type="number" min="1" max="5" step="1" value="1" style="width:52px">
       <button class="primary-btn" onclick="triggerEvaluateFromMetrics()">🔄 重新评估</button>
-      <span class="muted" style="font-size:12px">帧数/过滤IDLE/次数在顶部工具栏配置</span>
     </span>
   </div>
   <div id="metricsChips" class="metrics-chips"></div>

@@ -61,6 +61,9 @@ window.addEventListener("DOMContentLoaded", async () => {
   await loadGames();
   setupShardDropzone();   // 初始化切片拖拽导入
   initBackendHeader();    // 顶部后端状态（评估/分析 + 微调共用）
+  // 指标条帧数输入：用户手动改过就标记，避免被当前帧数覆盖
+  const tsi2 = document.getElementById("testSizeInput2");
+  if (tsi2) tsi2.addEventListener("input", () => { tsi2.dataset.userEdited = "1"; });
   // 若后台仍有探测/下载任务在跑，恢复进度轮询
   try {
     const st = await api("/api/rescan/status");
@@ -238,8 +241,9 @@ async function loadMetricsBanner() {
   try {
     // 跟随当前 shift 选择器（auto=最优；具体 k 则实时返回该步指标）
     const shift = (document.getElementById("shiftSelect") || {}).value || "auto";
-    // 过滤 IDLE 口径切换（Tab① 评估入口勾选 → 指标条按非 IDLE 口径显示）
-    const fidleEl = document.getElementById("evalFilterIdle");
+    // 过滤 IDLE 口径切换（指标条勾选优先，其次 Tab① 评估入口）
+    const fidleEl = document.getElementById("metricsFilterIdle")
+      || document.getElementById("evalFilterIdle");
     const fidle = !!(fidleEl && fidleEl.checked);
     const d = await api(`/api/metrics?game=${encodeURIComponent(state.game)}&video=${encodeURIComponent(state.video)}&shift=${shift}&filter_idle=${fidle ? "1" : "0"}`);
     banner.classList.remove("hidden");
@@ -247,6 +251,12 @@ async function loadMetricsBanner() {
     const nFrames = (fidle && d.n_frames_nonidle != null) ? `${d.n_frames_nonidle}(非IDLE)` : (d.metrics.test_frames ?? d.test_frames);
     document.getElementById("metricsScope").textContent =
       `${d.game} / ${d.video} · ${nFrames} 帧 · ${shiftLabel}${fidle ? " · 过滤IDLE口径" : ""}`;
+    // 同步"重新评估"帧数输入框的当前值（便于改帧数后重跑）
+    const tsi = document.getElementById("testSizeInput2");
+    if (tsi) {
+      const cur = d.metrics.test_frames ?? d.test_frames;
+      if (cur && !tsi.dataset.userEdited) tsi.value = cur;
+    }
     const m = d.metrics, ref = d.reference, v = d.verdicts;
     const chips = [
       { label: fidle ? "按键一致率(非IDLE逐帧全对)" : "按键一致率(逐帧全对)", value: (m.acc_17keys * 100).toFixed(1) + "%",
@@ -768,19 +778,22 @@ function renderEvalGuide() {
     </div>`;
 }
 
-// 顶部固定/指标条"运行评估"：读取帧数/过滤IDLE/评估次数并启动（已评估/未评估均可）
-// 评估启动：读取 Tab① 评估入口的帧数/过滤IDLE/评估次数（未渲染时用默认）
+// 指标条"重新评估"/Tab① 评估入口：读取帧数/过滤IDLE/评估次数并启动（已评估/未评估均可）
+// 帧数/口径输入优先级：指标条(testSizeInput2) → Tab① 引导(testSizeInput) → 默认 200
 async function triggerEvaluateFromMetrics() {
   if (!state.game || !state.video) { showError("请先选择游戏和视频"); return; }
-  const inp = document.getElementById("testSizeInput");
+  const inp = document.getElementById("testSizeInput2")
+    || document.getElementById("testSizeInput");
   const val = inp ? inp.value.trim() : "";
   const n = parseInt(val, 10) || 200;   // 无输入时默认 200
   if (n < 10 || n > 5000) { showError("测试集帧数应在 10~5000 之间"); return; }
   if (inp) inp.dataset.userEdited = "1";
-  // 过滤 IDLE / 评估次数：读取 Tab① 评估入口控件
-  const fidleEl = document.getElementById("evalFilterIdle");
+  // 过滤 IDLE / 评估次数：优先指标条，其次 Tab① 引导
+  const fidleEl = document.getElementById("metricsFilterIdle")
+    || document.getElementById("evalFilterIdle");
   const fidle = !!(fidleEl && fidleEl.checked);
-  const rpInp = document.getElementById("evalRepeatsInput");
+  const rpInp = document.getElementById("metricsRepeatsInput")
+    || document.getElementById("evalRepeatsInput");
   const rp = rpInp ? rpInp.value.trim() : "";
   if (rp && (!parseInt(rp, 10) || parseInt(rp, 10) < 1 || parseInt(rp, 10) > 5)) { showError("评估次数应在 1~5 之间"); return; }
   const params = [`game=${encodeURIComponent(state.game)}`, `video=${encodeURIComponent(state.video)}`, `test_size=${n}`];

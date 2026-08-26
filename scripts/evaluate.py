@@ -190,22 +190,31 @@ def build_testset(game: str, video: str, video_file: Path, fps: int,
         for r in annotations.filter(pl.col("video") == video).to_dicts()
     }
 
+    def _extract_frame(s, out_path: Path) -> bool:
+        """尝试抽帧：优先 -ss 前置（快 seek）；失败换 -ss 后置 + -noaccurate_seek（兼容性 seek）。"""
+        cmds = [
+            [ffmpeg, "-y", "-ss", f"{s['second']:.3f}", "-i", str(video_file),
+             "-frames:v", "1", str(out_path)],
+            [ffmpeg, "-y", "-noaccurate_seek", "-i", str(video_file),
+             "-ss", f"{s['second']:.3f}", "-frames:v", "1", str(out_path)],
+        ]
+        for attempt, cmd in enumerate(cmds):
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=30)
+            except Exception:  # noqa: BLE001
+                pass
+            if out_path.exists() and out_path.stat().st_size > 0:
+                return True
+            out_path.unlink(missing_ok=True)
+        return False
+
     rows = []
     for i, s in enumerate(samples):
         out_path = out_dir / f"{s['video']}_f{s['absolute_frame']:05d}.jpg"
         if not (out_path.exists() and out_path.stat().st_size > 0):
-            for attempt in range(2):
-                subprocess.run(
-                    [ffmpeg, "-y", "-ss", f"{s['second']:.3f}", "-i", str(video_file),
-                     "-frames:v", "1", str(out_path)],
-                    capture_output=True, timeout=30,
-                )
-                if out_path.exists() and out_path.stat().st_size > 0:
-                    break
-                out_path.unlink(missing_ok=True)
-        if not (out_path.exists() and out_path.stat().st_size > 0):
-            print(f"WARN: 抽帧失败 frame={s['absolute_frame']}", flush=True)
-            continue
+            if not _extract_frame(s, out_path):
+                print(f"WARN: 抽帧失败 frame={s['absolute_frame']}", flush=True)
+                continue
         ann = ann_lookup.get((s["video"], s["chunk"], s["frame_idx"]), {})
         jl = ann.get("j_left", [0.0, 0.0])
         jr = ann.get("j_right", [0.0, 0.0])
