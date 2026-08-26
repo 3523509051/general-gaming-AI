@@ -569,12 +569,6 @@ def api_metrics():
     if row is None:
         return err(f"「{game}/{video}」尚未评估，请先在 Tab③ 运行评估", 404)
 
-    # 测试集帧数以「实际测试集 CSV 行数」为准（重新评估/改帧数后自动跟随，而非 DB 历史快照）
-    try:
-        real_frames = len(get_testset(game, video))
-    except Exception:  # noqa: BLE001
-        real_frames = int(row["test_frames"])
-
     # 读 metrics 明细（shift 0~17 全行，优先按视频隔离文件）
     import csv as _csv
     metrics_rows = []
@@ -584,10 +578,17 @@ def api_metrics():
             metrics_rows = list(_csv.DictReader(open(cand, encoding="utf-8")))
             break
 
-    # 选定 shift：显式参数 > auto(DB 最优)
+    # 最优 shift：优先从 metrics 明细现算（远程评估产物回传后本地 DB 可能未同步）
+    best_shift = int(row["best_shift"])
+    if metrics_rows:
+        try:
+            best_shift = int(max(metrics_rows, key=lambda m: float(m["acc_17keys_all"]))["shift"])
+        except (ValueError, KeyError):  # noqa: PERF203
+            pass
+    # 选定 shift：显式参数 > auto(现算最优)
     shift_param = request.args.get("shift", "auto")
     if shift_param == "auto":
-        shift = int(row["best_shift"])
+        shift = best_shift
     else:
         try:
             shift = max(0, min(17, int(shift_param)))
@@ -599,19 +600,38 @@ def api_metrics():
     if metrics_rows:
         mrow = next((m for m in metrics_rows if int(m["shift"]) == shift), None)
     if mrow is not None:
-        acc = float(mrow["acc_17keys_all"])          # B 口径：逐帧全对
+        # 可选过滤 IDLE 口径：勾选后按键一致率用非 IDLE 帧统计（仅新版 evaluate.py 产物有该列）
+        filter_idle = request.args.get("filter_idle", "0").strip() in ("1", "true", "yes")
+        use_nonidle = filter_idle and mrow.get("acc_17keys_all_nonidle", "") not in ("", "nan")
+        acc = float(mrow["acc_17keys_all_nonidle"] if use_nonidle else mrow["acc_17keys_all"])  # B 口径：逐帧全对
         recall = float(mrow["btn_recall"]) if mrow["btn_recall"] not in ("nan", "") else None
         precision = float(mrow["btn_precision"]) if mrow["btn_precision"] not in ("nan", "") else None
         corr_x = float(mrow["corr_jl_x"]) if mrow["corr_jl_x"] not in ("nan", "") else None
         corr_y = float(mrow["corr_jl_y"]) if mrow["corr_jl_y"] not in ("nan", "") else None
         mse = float(mrow["mse_jl_x"])
+        n_frames_nonidle = int(float(mrow["n_frames_nonidle"])) if mrow.get("n_frames_nonidle", "") not in ("", "nan") else None
     else:
+        filter_idle = False
         acc = row["acc_17keys"]
         recall = row["recall"]
         precision = row["precision"]
         corr_x = row["corr_jl_x"]
         corr_y = row["corr_jl_y"]
         mse = row["mse_jl"]
+        n_frames_nonidle = None
+
+    # 测试集帧数：优先取 metrics 明细的 n_frames（真实评估帧数，远程评估回传后也正确）；
+    # 旧产物无该列时回退本地测试集 CSV 行数，再回退 DB 历史快照
+    if mrow is not None and mrow.get("n_frames", "") not in ("", "nan"):
+        try:
+            real_frames = int(float(mrow["n_frames"]))
+        except (ValueError, TypeError):  # noqa: PERF203
+            real_frames = len(get_testset(game, video))
+    else:
+        try:
+            real_frames = len(get_testset(game, video))
+        except Exception:  # noqa: BLE001
+            real_frames = int(row["test_frames"])
 
     # 摇杆相关系数：x/y 两轴取有效值中的较大者作为综合代表（更乐观口径）
     vals = [c for c in (corr_x, corr_y)
@@ -622,8 +642,10 @@ def api_metrics():
         "game": game,
         "video": video,
         "test_frames": real_frames,
-        "best_shift": row["best_shift"],
+        "best_shift": best_shift,
         "shift": shift,
+        "filter_idle": filter_idle,
+        "n_frames_nonidle": n_frames_nonidle,
         "metrics": {
             "acc_17keys": acc,
             "btn_recall": recall,
@@ -1232,6 +1254,17 @@ def api_evaluate():
                 return err("test_size 应在 10~5000 之间", 400)
         except ValueError:
             return err("test_size 必须是整数", 400)
+    # 过滤 IDLE 口径 + 多次评估取均值（与微调面板一致）
+    filter_idle = request.args.get("filter_idle", "0").strip() in ("1", "true", "yes")
+    repeats_raw = request.args.get("eval_repeats", "").strip()
+    eval_repeats = 1
+    if repeats_raw:
+        try:
+            eval_repeats = int(repeats_raw)
+            if eval_repeats < 1 or eval_repeats > 5:
+                return err("eval_repeats 应在 1~5 之间", 400)
+        except ValueError:
+            return err("eval_repeats 必须是整数", 400)
     assert_lineage(game, video)  # 需已提取（有 manifest + annotations）
     if not (DATA_ROOT / "videos" / f"{game}_{video}.mp4").exists():
         return err("该视频未下载，评估需要本地视频文件。请先用「下载视频」下载。", 400)
@@ -1248,28 +1281,121 @@ def api_evaluate():
             return err("已有评估任务在运行，请稍候", 409)
         _eval_task.update(running=True, game=game, video=video, stage="evaluating",
                           log_tail="", error=None, test_size=test_size,
+                          filter_idle=filter_idle, eval_repeats=eval_repeats,
                           started_at=time.strftime("%H:%M:%S"), proc=None)
-    threading.Thread(target=_run_evaluate, args=(game, video, fps, test_size), daemon=True).start()
+    # 按微调后端分发：remote 时评估也放 A100（worker /eval_base），本地仅数据检查/上传/回传
+    _ensure_backend_loaded()
+    backend = FT_BACKEND["mode"]
+    remote_url = FT_BACKEND["remote_url"] if backend == "remote" else ""
+    if backend == "remote":
+        threading.Thread(target=_run_evaluate_remote,
+                         args=(game, video, test_size, remote_url, eval_repeats), daemon=True).start()
+    else:
+        threading.Thread(target=_run_evaluate,
+                         args=(game, video, fps, test_size, eval_repeats), daemon=True).start()
     return jsonify({"ok": True, "data": {"status": "started", "game": game,
                                          "video": video, "fps": fps,
-                                         "test_size": test_size}}), 202
+                                         "test_size": test_size,
+                                         "backend": backend,
+                                         "filter_idle": filter_idle,
+                                         "eval_repeats": eval_repeats}}), 202
 
 
-def _run_evaluate(game: str, video: str, fps: int, test_size: int | None = None):
-    log = DATA_ROOT / f"evaluate_{game}_{video}.log"
+def _run_evaluate(game: str, video: str, fps: int, test_size: int | None = None,
+                  eval_repeats: int = 1):
+    reps = max(1, eval_repeats)
     try:
-        cmd = [sys.executable, str(REPO / "scripts" / "evaluate.py"),
-               "--game", game, "--video", video, "--fps", str(fps)]
-        if test_size is not None:
-            cmd += ["--test-size", str(test_size)]
-        proc = subprocess.Popen(cmd, cwd=str(REPO),
-                                stdout=open(log, "w", encoding="utf-8"),
-                                stderr=subprocess.STDOUT)
+        for i in range(reps):
+            rtag = "ng" if reps == 1 else f"ng_s{i}"
+            log = DATA_ROOT / (f"evaluate_{game}_{video}.log" if reps == 1
+                               else f"evaluate_{game}_{video}_s{i}.log")
+            cmd = [sys.executable, str(REPO / "scripts" / "evaluate.py"),
+                   "--game", game, "--video", video, "--fps", str(fps),
+                   "--tag", rtag, "--infer-seed", str(i)]
+            if test_size is not None:
+                cmd += ["--test-size", str(test_size)]
+            proc = subprocess.Popen(cmd, cwd=str(REPO),
+                                    stdout=open(log, "w", encoding="utf-8"),
+                                    stderr=subprocess.STDOUT)
+            with _eval_lock:
+                _eval_task["proc"] = proc
+            rc = proc.wait()
+            if rc != 0:
+                raise RuntimeError(f"evaluate.py 失败（退出码 {rc}，第 {i+1}/{reps} 次），日志: data/{log.name}")
+        # 多副本时复制第一次结果为主副本（metrics_*_ng.csv，供 /api/metrics 等读）
+        if reps > 1:
+            first = DATA_ROOT / game / "eval" / f"metrics_{video}_ng_s0.csv"
+            main = DATA_ROOT / game / "eval" / f"metrics_{video}_ng.csv"
+            if first.exists():
+                shutil.copy(first, main)
+        clear_cache(game)
         with _eval_lock:
-            _eval_task["proc"] = proc
-        rc = proc.wait()
-        if rc != 0:
-            raise RuntimeError(f"evaluate.py 失败（退出码 {rc}），日志: data/evaluate_{game}_{video}.log")
+            _eval_task.update(running=False, stage="done", proc=None)
+    except Exception as e:  # noqa: BLE001
+        with _eval_lock:
+            _eval_task.update(running=False, stage="failed", proc=None, error=str(e)[:300])
+
+
+def _run_evaluate_remote(game: str, video: str, test_size: int | None, remote_url: str,
+                         eval_repeats: int = 1):
+    """远程评估：数据检查/自动上传 → worker /eval_base 评估 → 回传 ng CSV。"""
+    log = DATA_ROOT / f"evaluate_{game}_{video}.log"
+
+    def _log(msg: str):
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+
+    try:
+        _log(f"=== 远程评估（A100 {remote_url}，test_size={test_size or 200}） ===")
+        # 1) 远程数据齐备性：缺则自动上传（视频+manifest+annotations）
+        with _eval_lock:
+            _eval_task.update(stage="uploading")
+        missing = remote_data_check(remote_url, game, video)
+        if missing:
+            _log(f"远程缺失数据: {missing}，开始自动上传 ...")
+            ssh_cfg = FT_BACKEND.get("ssh") or {}
+            if not ssh_cfg.get("password"):
+                raise RuntimeError("远程缺数据且未配置 SSH 凭据（后端设置里填 SSH 密码后重试）")
+            remote_upload_data(ssh_cfg, game, video, log_fn=_log)
+            _log("数据上传完成")
+        else:
+            _log("远程数据齐备")
+        # 2) 远程评估（零样本，tag=ng，与微调链基线同副本；eval_repeats>1 生成 _s{i} 副本）
+        code, resp = remote_eval_base(remote_url, game, video, test_size, eval_repeats=max(1, eval_repeats))
+        if code != 202:
+            raise RuntimeError(f"远程评估启动失败（{code}）: {resp}")
+        # 3) 轮询到完成（阶段同步到 _eval_task）
+        st = _poll_remote_until_done(remote_url, game, video, 0, _log, task=_eval_task)
+        if st.get("stage") != "done":
+            raise RuntimeError(f"远程评估未成功完成: {st.get('stage')} / {st.get('error')}")
+        # 4) 回传 ng 副本（repeats>1 时自动拉全 _s{i}）
+        eval_dir = DATA_ROOT / game / "eval"
+        remote_fetch_csv(remote_url, game, video, 0,
+                         eval_dir, log_fn=_log, tag="ng",
+                         repeats=max(1, eval_repeats))
+        # 5) 零样本产物提升为主副本：/api/metrics、/api/sequences 读的是
+        #    metrics_<video>.csv / predictions_<video>.csv，不回传主副本会显示旧数据
+        for stem in (f"metrics_{video}", f"predictions_{video}"):
+            src = eval_dir / f"{stem}_ng.csv"
+            dst = eval_dir / f"{stem}.csv"
+            if src.exists():
+                shutil.copy(src, dst)
+                _log(f"{dst.name} 已更新为主副本（{src.name}）")
+        # 6) 回传测试集：远程评估按 --test-size 构建的 test_set_<video>.csv，
+        #    不同步会导致本地帧浏览（/api/testset）与 1000 帧评估口径不一致；
+        #    拉取失败不阻塞完成（前端回退旧测试集）
+        try:
+            import urllib.parse as _up
+            import urllib.request as _ur
+            (DATA_ROOT / game).mkdir(parents=True, exist_ok=True)
+            qs = _up.urlencode({"game": game, "video": video})
+            with _ur.urlopen(f"{remote_url}/testset_csv?{qs}", timeout=30) as _r:
+                (DATA_ROOT / game / f"test_set_{video}.csv").write_text(
+                    _r.read().decode("utf-8"), encoding="utf-8")
+            _log(f"test_set_{video}.csv 已回传（远程测试集，{test_size or 200} 帧口径）")
+        except Exception as e:  # noqa: BLE001
+            _log(f"测试集回传失败（忽略）: {str(e)[:150]}")
+        _log("评估结果已回传")
         clear_cache(game)
         with _eval_lock:
             _eval_task.update(running=False, stage="done", proc=None)
@@ -1366,9 +1492,12 @@ def remote_worker_status(url: str) -> dict | None:
 
 
 def _poll_remote_until_done(url: str, game: str, video: str, samples: int,
-                            log_fn) -> dict:
-    """轮询远程任务到结束，返回最终 status dict（期间日志打到 log_fn）。"""
+                            log_fn, task: dict | None = None) -> dict:
+    """轮询远程任务到结束，返回最终 status dict（期间日志打到 log_fn）。
+    task 指定同步阶段到哪个本地任务（默认微调 _ft_task；评估传 _eval_task）。"""
     import urllib.request
+    task = _ft_task if task is None else task
+    lock = _eval_lock if task is _eval_task else _ft_lock
     st = {}
     while True:
         try:
@@ -1377,8 +1506,8 @@ def _poll_remote_until_done(url: str, game: str, video: str, samples: int,
             # 同步远程真实阶段到本地（前端据此显示 1/2 微调 or 2/2 评估）
             r_stage = st.get("stage")
             if r_stage in ("finetuning", "evaluating", "baseline", "uploading"):
-                with _ft_lock:
-                    _ft_task["stage"] = r_stage
+                with lock:
+                    task["stage"] = r_stage
             tail = st.get("log_tail") or ""
             if tail:
                 last = tail.splitlines()[-1]
@@ -1451,13 +1580,16 @@ def _csv_n_frames(path: Path) -> int | None:
         return None
 
 
-def remote_eval_base(url: str, game: str, video: str, test_size: int | None) -> tuple[int, dict | str]:
+def remote_eval_base(url: str, game: str, video: str, test_size: int | None,
+                     eval_repeats: int = 1) -> tuple[int, dict | str]:
     """调远程 worker /eval_base 跑零样本基线评估（A100），返回 (status_code, data或error)。"""
     import urllib.parse
     import urllib.request
     params = {"game": game, "video": video}
     if test_size:
         params["test_size"] = str(test_size)
+    if eval_repeats and eval_repeats > 1:
+        params["eval_repeats"] = str(eval_repeats)
     qs = urllib.parse.urlencode(params)
     try:
         req = urllib.request.Request(url + "/eval_base?" + qs, method="POST")
@@ -1511,9 +1643,16 @@ def remote_fetch_csv(url: str, game: str, video: str, samples: int,
                 return False
             raise
 
-    # 决定要拉哪些副本：主副本存在则只拉主副本；否则探测 _s0.._sN
+    # 决定要拉哪些副本：主副本存在则「主副本 + 全部 _s{i} 副本」（eval_repeats>1 供均值±std）；
+    # 主副本缺失则探测 _s0.._sN（如 recover 接管后 eval_repeats 与原始请求不一致）
     if _metrics_exists(tag):
         targets = [tag]
+        for i in range(5):
+            t = f"{tag}_s{i}"
+            if _metrics_exists(t):
+                targets.append(t)
+            else:
+                break
     else:
         targets = []
         for i in range(5):

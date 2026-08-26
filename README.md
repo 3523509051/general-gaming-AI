@@ -246,7 +246,7 @@ NitroGen\.venv\Scripts\python.exe scripts\plot_shift_scan.py --game <game> --vid
 
 1. 打开 Web（http://localhost:5000）→ Tab③「扩展 A · 小样本微调对照闭环」面板；
 2. 顶部后端选 **本机 GPU**；
-3. 填样本帧数（默认 1000；填超过总标注帧数即用全量）/ epochs（默认 1）/ batch（留空自动按显存，8GB→2~4）；
+3. 填样本帧数（默认 1000；填超过总标注帧数即用全量）/ epochs（默认 1）/ batch（留空自动按显存，8GB→2~4）；可选「测试集帧数」（默认 200，10~5000）、「过滤IDLE帧」（评估生成非 IDLE 口径）、「评估次数」（>1 时多推理 seed 评估 N 次，对照表显示均值±std）；
 4. 点「启动微调并评估」→ 自动执行：补零样本基线副本（首次）→ 本机微调 → 本机评估；
 5. 完成后对照表自动出现；「运行日志」终端窗口实时显示训练 step/loss。
 
@@ -325,13 +325,15 @@ NitroGen\.venv\Scripts\python.exe scripts\evaluate.py --game <game> --video <vid
 | `生成静态图` | Tab② 统计图中无图时：后台生成 matplotlib PNG |
 | `运行评估` | Tab③ 无评估产物时：后台跑 evaluate.py（建测试集+推理+shift 扫描+写库），自动刷新序列对比 |
 
-> 游戏下拉框按切片分组显示（optgroup）；指标条带「测试集帧数 + 重新评估」入口（默认 200，可调 10~5000）。
+> 游戏下拉框按切片分组显示（optgroup）；指标条（📊 零样本评估指标）带「测试集帧数 + 过滤IDLE帧 + 评估次数 + 重新评估」入口：帧数默认 200（可调 10~5000）、勾选过滤 IDLE 即时切换为「非 IDLE 帧」口径、评估次数 >1 时用不同推理 seed 评估 N 次并在对照表显示均值±std。评估运行中指标条显示「评估运行中…」，完成后自动刷新。
 
-> 后台任务（提取/评估/探测/下载）互斥，同一时间只运行一个；所有任务都有进度横幅 + 可停止。
+> 后台任务（提取/评估/探测/下载）互斥，同一时间只运行一个；所有任务都有进度横幅 + 可停止；刷新页面后若服务端仍在跑评估，进度横幅会自动恢复显示。
+
+> 远程评估一致性：远程 A100 评估完成后自动回传 `metrics/predictions` 主副本与远程构建的测试集，本地指标条 / 帧浏览 / 序列对比与远程评估口径完全一致；`eval_repeats>1` 时拉取全部 `_s{i}` 副本供均值±std 对照。
 
 ### 后端接口
 
-除 `/api/games`、`/api/shaders` 外，其余接口均需查询参数 `game=<游戏>&video=<视频>`；`/api/frame` 另需 `frame=<绝对帧号>`；`/api/metrics` 可选 `shift=k`（不传则用最优 shift）。
+除 `/api/games`、`/api/shaders` 外，其余接口均需查询参数 `game=<游戏>&video=<视频>`；`/api/frame` 另需 `frame=<绝对帧号>`；`/api/metrics` 可选 `shift=k`（不传则从 metrics 明细现算最优 shift）与 `filter_idle=1`（按键一致率切到非 IDLE 帧口径）。
 
 | 接口 | 必填参数 | 说明 |
 | --- | --- | --- |
@@ -341,9 +343,9 @@ NitroGen\.venv\Scripts\python.exe scripts\evaluate.py --game <game> --video <vid
 | `/api/stats` | game, video | 统计分布（按键/摇杆，全量标注实时算） |
 | `/api/sequences` | game, video | 序列 + Top-5 + 差异定义 |
 | `/api/testset` | game, video | 测试集帧列表 |
-| `/api/metrics` | game, video（shift 可选） | 核心指标对比条 |
+| `/api/metrics` | game, video（shift、filter_idle 可选） | 核心指标对比条（shift 缺省从 metrics 明细现算最优；filter_idle=1 时按键一致率用非 IDLE 帧口径，帧数取真实评估 n_frames） |
 | `/api/rescan` | game（可选，不传全量） | 探测视频链接 |
-| `/api/evaluate` | game, video（test_size 可选） | 触发评估 |
+| `/api/evaluate` | game, video, test_size(10~5000), filter_idle(0/1), eval_repeats(1~5) | 触发评估（按后端分发：本机/远程 A100；eval_repeats>1 时多推理 seed 评估取均值±std；完成后自动回传主副本+测试集） |
 | `/api/download` | game, video | 触发视频下载 |
 | `/api/genplots` | game, video | 生成静态图 |
 | `/api/shaders` | 无 | 本地切片列表 |
@@ -360,7 +362,7 @@ NitroGen\.venv\Scripts\python.exe scripts\evaluate.py --game <game> --video <vid
 | `/api/finetune/pull_weight/status` | 无 | 权重下载进度 |
 | `/api/prefs` | game, video, samples, epochs, batch, test_size, filter_idle, eval_repeats | 保存/恢复上次选择的游戏视频与微调参数 |
 
-**远程 worker 接口**（部署于服务器，端口 56272）：`/health`（GPU 信息+任务状态）、`/start`（启动微调+评估，含 eval_only/test_size/eval_repeats）、`/eval_base`（零样本基线评估）、`/has_ckpt`（权重存在性+训练参数 meta）、`/status`、`/cancel`、`/data_check`（视频/标注齐全性）、`/logtail`（日志尾部）、`/metrics_csv`、`/predictions_csv`（评估结果回传）、`/download`（权重下载）。
+**远程 worker 接口**（部署于服务器，端口 56272）：`/health`（GPU 信息+任务状态）、`/start`（启动微调+评估，含 eval_only/test_size/eval_repeats）、`/eval_base`（零样本基线评估）、`/has_ckpt`（权重存在性+训练参数 meta）、`/status`、`/cancel`、`/data_check`（视频/标注齐全性）、`/logtail`（日志尾部）、`/metrics_csv`、`/predictions_csv`、`/testset_csv`（评估产物回传：指标 / 逐帧预测 / 远程测试集）、`/download`（权重下载）。
 
 ### 安全说明
 

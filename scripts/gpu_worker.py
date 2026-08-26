@@ -83,7 +83,8 @@ def has_ckpt():
 
 @app.post("/eval_base")
 def eval_base():
-    """零样本基线评估（evaluate.py 无 --ckpt --tag ng），产物 CSV 供 /metrics_csv 回传。"""
+    """零样本基线评估（evaluate.py 无 --ckpt --tag ng），产物 CSV 供 /metrics_csv 回传。
+    eval_repeats>1 时用不同推理 seed 评估 N 次，生成 metrics_*_ng_s{i}.csv 副本（主副本=第一次）。"""
     game = request.args.get("game", "").strip()
     video = request.args.get("video", "").strip()
     test_size_raw = request.args.get("test_size", "").strip()
@@ -97,34 +98,55 @@ def eval_base():
                 raise ValueError
         except ValueError:
             return jsonify({"ok": False, "error": "test_size 应为 10~5000 整数"}), 400
+    repeats_raw = request.args.get("eval_repeats", "").strip()
+    eval_repeats = 1
+    if repeats_raw:
+        try:
+            eval_repeats = int(repeats_raw)
+            if eval_repeats < 1 or eval_repeats > 5:
+                raise ValueError
+        except ValueError:
+            return jsonify({"ok": False, "error": "eval_repeats 应为 1~5 整数"}), 400
     with _lock:
         if _task["running"]:
             return jsonify({"ok": False, "error": "已有任务运行中"}), 409
         _task.update(running=True, game=game, video=video, samples=None,
                      epochs=None, batch=None, out=f"base_{video}", proc=None,
-                     test_size=test_size, eval_only=False, log_tail="", error=None,
+                     test_size=test_size, eval_only=False, eval_repeats=eval_repeats,
+                     log_tail="", error=None,
                      started_at=time.strftime("%H:%M:%S"), stage="baseline")
-    threading.Thread(target=_run_eval_base, args=(game, video, test_size), daemon=True).start()
+    threading.Thread(target=_run_eval_base,
+                     args=(game, video, test_size, eval_repeats), daemon=True).start()
     return jsonify({"ok": True, "data": {"status": "started", "stage": "baseline"}}), 202
 
 
-def _run_eval_base(game: str, video: str, test_size: int | None):
+def _run_eval_base(game: str, video: str, test_size: int | None, eval_repeats: int = 1):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    log = OUT_DIR / f"base_{video}.eval.log"
+    import shutil
+    reps = max(1, eval_repeats)
     try:
-        cmd = [str(BASE / ".venv" / "bin" / "python"), str(EVALUATE),
-               "--game", game, "--video", video, "--fps", "30",
-               "--tag", "ng", "--no-plots"]
-        if test_size:
-            cmd += ["--test-size", str(test_size)]
-        proc = subprocess.Popen(cmd, cwd=str(BASE),
-                                stdout=open(log, "w", encoding="utf-8"),
-                                stderr=subprocess.STDOUT)
-        with _lock:
-            _task["proc"] = proc
-        rc = proc.wait()
-        if rc != 0:
-            raise RuntimeError(f"基线评估退出码 {rc}，日志: {log}")
+        for i in range(reps):
+            rtag = "ng" if reps == 1 else f"ng_s{i}"
+            log_i = OUT_DIR / (f"base_{video}.eval.log" if reps == 1 else f"base_{video}.eval{i}.log")
+            cmd = [str(BASE / ".venv" / "bin" / "python"), str(EVALUATE),
+                   "--game", game, "--video", video, "--fps", "30",
+                   "--tag", rtag, "--no-plots", "--infer-seed", str(i)]
+            if test_size:
+                cmd += ["--test-size", str(test_size)]
+            proc = subprocess.Popen(cmd, cwd=str(BASE),
+                                    stdout=open(log_i, "w", encoding="utf-8"),
+                                    stderr=subprocess.STDOUT)
+            with _lock:
+                _task["proc"] = proc
+            rc = proc.wait()
+            if rc != 0:
+                raise RuntimeError(f"基线评估退出码 {rc}（第 {i+1}/{reps} 次），日志: {log_i}")
+        # 多副本时复制第一次结果为主副本（metrics_*_ng.csv，供 /api/metrics 等读）
+        if reps > 1:
+            first = DATA / game / "eval" / f"metrics_{video}_ng_s0.csv"
+            main = DATA / game / "eval" / f"metrics_{video}_ng.csv"
+            if first.exists():
+                shutil.copy(first, main)
         with _lock:
             _task.update(running=False, stage="done", proc=None)
     except Exception as e:  # noqa: BLE001
@@ -334,6 +356,19 @@ def predictions_csv():
     if not p.exists():
         return jsonify({"ok": False, "error": f"远程无预测文件 {p.name}"}), 404
     return Response(p.read_text(encoding="utf-8"), mimetype="text/csv")
+
+
+@app.get("/testset_csv")
+def testset_csv():
+    """回传测试集 CSV（远程评估构建的测试集，保证本地前端帧浏览/序列对比口径一致）。"""
+    game = request.args.get("game", "").strip()
+    video = request.args.get("video", "").strip()
+    if not (game and video):
+        return jsonify({"ok": False, "error": "参数 game/video 必填"}), 400
+    for cand in (DATA / game / f"test_set_{video}.csv", DATA / game / "test_set.csv"):
+        if cand.exists():
+            return Response(cand.read_text(encoding="utf-8"), mimetype="text/csv")
+    return jsonify({"ok": False, "error": f"远程无测试集 {game}/{video}"}), 404
 
 
 @app.get("/download")

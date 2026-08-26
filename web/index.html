@@ -33,6 +33,10 @@
     <button id="rescanBtn" class="ghost-btn" onclick="triggerRescan()" title="重新探测视频链接可用性">探测链接 ↻</button>
     <button id="importShardBtn" class="ghost-btn" onclick="openShardModal()" title="扫描本地新切片并合并到游戏清单（多切片导入）">导入切片 📦</button>
   </div>
+  <div class="backend-block" id="backendBlock" onclick="openBackendModal()" title="配置计算后端：评估/分析与微调都在所选后端运行">
+    <span class="backend-dot" id="backendDot"></span>
+    <span id="backendLabel">后端：加载中…</span>
+  </div>
 </header>
 
 <!-- 导入切片 modal：拖拽上传新切片 → 复制到 data/shards/ → 扫描生成独立清单 -->
@@ -54,6 +58,34 @@
   </div>
 </div>
 
+<!-- 计算后端配置 modal（顶部"后端"块点击打开）：评估/分析与微调共用 -->
+<div id="backendModal" class="modal hidden">
+  <div class="modal-box">
+    <h3>计算后端配置</h3>
+    <p class="modal-note">评估（分析）与微调都在所选后端运行：远程后端（A100）无需本机显卡；本机后端用当前电脑 GPU。<br>下方地址/账号为回填你<b>本机已保存的配置</b>（data/remote_worker.json，该目录被 .gitignore 保护，<b>不入库、不提交</b>）；SSH 密码<b>始终不回填</b>，留空表示不修改。</p>
+    <div class="backend-form">
+      <div style="margin:10px 0">
+        <label>后端：</label>
+        <select id="bkMode" onchange="document.getElementById('bkRemoteFields').style.display=this.value==='remote'?'block':'none'">
+          <option value="local">本机（当前电脑 GPU）</option>
+          <option value="remote">远程服务器（A100）</option>
+        </select>
+      </div>
+      <div id="bkRemoteFields" style="display:none;margin:6px 0">
+        <label>服务器地址：<input id="bkUrl" type="text" placeholder="http://服务器IP:端口" style="width:220px"></label><br>
+        <label>SSH 账号：<input id="bkSshUser" type="text" placeholder="服务器用户名" style="width:140px"></label>
+        <label>SSH 端口：<input id="bkSshPort" type="text" placeholder="SSH端口" style="width:80px"></label><br>
+        <label>SSH 密码：<input id="bkSshPwd" type="password" placeholder="留空=不修改" style="width:200px"></label>
+      </div>
+      <div id="bkStatus" class="muted"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="primary-btn" onclick="saveBackendHeader()">保存并连接</button>
+      <button class="ghost-btn" onclick="closeBackendModal()">关闭</button>
+    </div>
+  </div>
+</div>
+
 <!-- 血缘状态条 -->
 <div class="lineage-bar" id="lineageBar">
   <span class="lineage-label">当前选择</span>
@@ -70,6 +102,11 @@
     <span class="metrics-resize">
       <label for="testSizeInput2">测试集帧数</label>
       <input id="testSizeInput2" type="number" min="10" max="5000" step="10" value="200">
+      <label class="metrics-check" title="评估时额外生成过滤 IDLE 口径（仅非 IDLE 帧统计），指标条可切换显示">
+        <input id="metricsFilterIdle" type="checkbox" onchange="loadMetricsBanner()"> 过滤IDLE帧
+      </label>
+      <label for="metricsRepeatsInput" title=">1 时用不同推理 seed 评估 N 次，对照表显示均值±std，判断差异是真实还是采样噪声">评估次数</label>
+      <input id="metricsRepeatsInput" type="number" min="1" max="5" step="1" value="1" style="width:52px">
       <button class="primary-btn" onclick="triggerEvaluateFromMetrics()">重新评估</button>
     </span>
   </div>

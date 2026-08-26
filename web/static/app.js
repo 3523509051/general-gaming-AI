@@ -60,6 +60,7 @@ function syncURL() {
 window.addEventListener("DOMContentLoaded", async () => {
   await loadGames();
   setupShardDropzone();   // 初始化切片拖拽导入
+  initBackendHeader();    // 顶部后端状态（评估/分析 + 微调共用）
   // 指标条帧数输入：用户手动改过就标记，避免被当前帧数覆盖
   const tsi = document.getElementById("testSizeInput2");
   if (tsi) tsi.addEventListener("input", () => { tsi.dataset.userEdited = "1"; });
@@ -111,8 +112,11 @@ function savePrefs() {
   if (eInp) p.set("epochs", eInp.value || "");
   if (bInp) p.set("batch", bInp.value || "");
   if (tInp) p.set("test_size", tInp.value || "");
-  if (fInp) p.set("filter_idle", fInp.checked ? "1" : "");
-  if (rInp) p.set("eval_repeats", rInp.value || "");
+  // 过滤 IDLE / 评估次数：指标条控件优先（存在时以它为准），否则用微调面板
+  const mfInp = document.getElementById("metricsFilterIdle");
+  const mrInp = document.getElementById("metricsRepeatsInput");
+  p.set("filter_idle", mfInp ? (mfInp.checked ? "1" : "") : (fInp && fInp.checked ? "1" : ""));
+  p.set("eval_repeats", mrInp ? (mrInp.value || "") : (rInp ? rInp.value : ""));
   fetch(`/api/prefs?${p}`, { method: "POST" }).catch(() => {});
 }
 
@@ -233,11 +237,15 @@ async function loadMetricsBanner() {
   try {
     // 跟随当前 shift 选择器（auto=最优；具体 k 则实时返回该步指标）
     const shift = (document.getElementById("shiftSelect") || {}).value || "auto";
-    const d = await api(`/api/metrics?game=${encodeURIComponent(state.game)}&video=${encodeURIComponent(state.video)}&shift=${shift}`);
+    // 过滤 IDLE 口径切换：勾选后 /api/metrics 返回非 IDLE 帧的按键一致率
+    const fidleEl = document.getElementById("metricsFilterIdle");
+    const fidle = !!(fidleEl && fidleEl.checked);
+    const d = await api(`/api/metrics?game=${encodeURIComponent(state.game)}&video=${encodeURIComponent(state.video)}&shift=${shift}&filter_idle=${fidle ? "1" : "0"}`);
     banner.classList.remove("hidden");
     const shiftLabel = shift === "auto" ? `shift k=${d.best_shift}(最优)` : `shift k=${shift}`;
+    const nFrames = (fidle && d.n_frames_nonidle != null) ? `${d.n_frames_nonidle}(非IDLE)` : (d.metrics.test_frames ?? d.test_frames);
     document.getElementById("metricsScope").textContent =
-      `${d.game} / ${d.video} · ${d.metrics.test_frames ?? d.test_frames} 帧 · ${shiftLabel}`;
+      `${d.game} / ${d.video} · ${nFrames} 帧 · ${shiftLabel}${fidle ? " · 过滤IDLE口径" : ""}`;
     // 同步"重新评估"帧数输入框的当前值（便于改帧数后重跑）
     const tsi = document.getElementById("testSizeInput2");
     if (tsi) {
@@ -246,7 +254,7 @@ async function loadMetricsBanner() {
     }
     const m = d.metrics, ref = d.reference, v = d.verdicts;
     const chips = [
-      { label: "按键一致率(逐帧全对)", value: (m.acc_17keys * 100).toFixed(1) + "%",
+      { label: fidle ? "按键一致率(非IDLE逐帧全对)" : "按键一致率(逐帧全对)", value: (m.acc_17keys * 100).toFixed(1) + "%",
         vs: `参考 ${(ref.acc_17keys * 100).toFixed(0)}%（17键全一致帧占比）`, good: v.acc_17keys, neutral: false },
       { label: "按键召回率", value: (m.btn_recall * 100).toFixed(1) + "%",
         vs: "—", good: null, neutral: true },
@@ -264,6 +272,14 @@ async function loadMetricsBanner() {
         <div class="mc-vs">${c.vs}</div>
       </div>`;
     }).join("");
+    // 勾选了过滤 IDLE 但当前产物无该列（旧版 evaluate 生成）→ 提示重跑
+    if (fidle && d.n_frames_nonidle == null) {
+      const note = document.createElement("div");
+      note.className = "metrics-ref-note";
+      note.style.color = "var(--orange)";
+      note.textContent = "⚠ 当前评估产物无过滤 IDLE 口径（旧版 evaluate.py 生成），请用下方「重新评估」并勾选「过滤IDLE帧」重跑。";
+      document.getElementById("metricsChips").appendChild(note);
+    }
   } catch (e) {
     banner.classList.add("hidden");  // 未评估或无测试集时隐藏
   }
@@ -727,8 +743,14 @@ function renderEvalGuide() {
            预计耗时 3~6 分钟（含模型加载），后台运行。</p>
         <div class="eval-guide-form">
           <label for="testSizeInput">测试集帧数：</label>
-          <input id="testSizeInput" type="number" min="10" max="5000" step="10" value="200">
+          <input id="testSizeInput" type="number" min="10" max="5000" step="10" value="${localStorage.getItem('evalTestSize') || '200'}">
           <span class="muted">改完后点下方按钮按新帧数评估</span>
+        </div>
+        <div class="eval-guide-form" style="margin-top:6px">
+          <label><input id="evalFilterIdle" type="checkbox" title="评估产物含过滤 IDLE 口径，对照表可切换显示"> 过滤IDLE帧</label>
+          <label for="evalRepeatsInput" style="margin-left:12px" title=">1 时多次推理 seed 评估，副本供均值±std 对照">评估次数：</label>
+          <input id="evalRepeatsInput" type="number" min="1" max="5" step="1" value="1" style="width:52px">
+          <span class="muted">>1 多次评估（均值见对照表）</span>
         </div>
         ${downloaded ? `
           <p class="eval-guide-warn">前置条件已满足（视频已下载）。</p>
@@ -748,6 +770,12 @@ async function triggerEvaluate() {
     const testSize = inp ? inp.value.trim() : "";
     const params = [`game=${encodeURIComponent(state.game)}`, `video=${encodeURIComponent(state.video)}`];
     if (testSize) params.push(`test_size=${encodeURIComponent(testSize)}`);
+    const fidle = document.getElementById("evalFilterIdle") && document.getElementById("evalFilterIdle").checked;
+    const rpInp = document.getElementById("evalRepeatsInput");
+    const rp = rpInp ? rpInp.value.trim() : "";
+    if (fidle) params.push("filter_idle=1");
+    if (rp && parseInt(rp, 10) > 1) params.push(`eval_repeats=${encodeURIComponent(rp)}`);
+    if (testSize) localStorage.setItem("evalTestSize", testSize);
     const r = await fetch(`/api/evaluate?${params.join("&")}`, { method: "POST" });
     const j = await r.json();
     if (!j.ok) { showError(j.error || "评估启动失败"); return; }
@@ -758,7 +786,7 @@ async function triggerEvaluate() {
   } catch (e) { showError("评估启动失败: " + e.message); }
 }
 
-// 指标条"重新评估"：读取帧数输入框并启动（已评估/未评估均可）
+// 指标条"重新评估"：读取帧数/过滤IDLE/评估次数并启动（已评估/未评估均可）
 async function triggerEvaluateFromMetrics() {
   if (!state.game || !state.video) { showError("请先选择游戏和视频"); return; }
   const inp = document.getElementById("testSizeInput2");
@@ -766,14 +794,29 @@ async function triggerEvaluateFromMetrics() {
   const n = parseInt(val, 10);
   if (!n || n < 10 || n > 5000) { showError("测试集帧数应在 10~5000 之间"); return; }
   if (inp) inp.dataset.userEdited = "1";
+  // 过滤 IDLE / 评估次数：优先读指标条控件，未渲染时回退到评估引导控件
+  const fidleEl = document.getElementById("metricsFilterIdle") || document.getElementById("evalFilterIdle");
+  const fidle = !!(fidleEl && fidleEl.checked);
+  const rpInp = document.getElementById("metricsRepeatsInput") || document.getElementById("evalRepeatsInput");
+  const rp = rpInp ? rpInp.value.trim() : "";
+  if (rp && (!parseInt(rp, 10) || parseInt(rp, 10) < 1 || parseInt(rp, 10) > 5)) { showError("评估次数应在 1~5 之间"); return; }
   const params = [`game=${encodeURIComponent(state.game)}`, `video=${encodeURIComponent(state.video)}`, `test_size=${n}`];
+  if (fidle) params.push("filter_idle=1");
+  if (rp && parseInt(rp, 10) > 1) params.push(`eval_repeats=${encodeURIComponent(rp)}`);
   try {
     const r = await fetch(`/api/evaluate?${params.join("&")}`, { method: "POST" });
     const j = await r.json();
     if (!j.ok) { showError(j.error || "评估启动失败"); return; }
     showEvalLog(true);
+    const opts = [];
+    if (fidle) opts.push("过滤IDLE");
+    if (rp && parseInt(rp, 10) > 1) opts.push(`评估 ${rp} 次`);
+    const optTxt = opts.length ? `（${opts.join("，")}）` : "";
     document.getElementById("seqChart").innerHTML =
-      `<div class="loading-block"><div class="spinner"></div>已按 ${n} 帧启动评估，正在后台运行…</div>`;
+      `<div class="loading-block"><div class="spinner"></div>已按 ${n} 帧启动评估${optTxt}，正在后台运行…</div>`;
+    // 立即给出明确反馈：指标条标注"评估运行中"，避免误以为旧数据未更新
+    const scope = document.getElementById("metricsScope");
+    if (scope) scope.textContent = `${state.game} / ${state.video} · 评估运行中…（完成后自动刷新）`;
     pollEvaluate();
   } catch (e) { showError("评估启动失败: " + e.message); }
 }
@@ -795,11 +838,16 @@ function pollEvaluate() {
     else logEl.classList.add("hidden");
     const txt = document.getElementById("evalText");
     if (st.running) {
-      txt.textContent = `评估运行中（${st.game}/${st.video}）… 模型加载 + 推理约 3~6 分钟`;
+      // 服务端评估在跑就必须显示进度框（刷新页面后恢复轮询也要重新显示）
+      showEvalLog(true);
+      txt.textContent = `评估运行中（${st.game}/${st.video}）… 模型加载 + 推理中（${st.test_size ? st.test_size + " 帧" : ""}${st.eval_repeats && st.eval_repeats > 1 ? " × " + st.eval_repeats + " 次" : ""}，帧数越多越久）`;
     } else {
       clearInterval(evalTimer);
       if (st.stage === "done") {
-        txt.textContent = "评估完成！序列对比与统计已生成并入库。";
+        const rp = st.eval_repeats || 1;
+        txt.textContent = st.filter_idle
+          ? `评估完成！（已记录过滤 IDLE 口径；${rp > 1 ? `评估 ${rp} 次，均值±std 见对照表` : "序列对比与统计已生成并入库"}）`
+          : (rp > 1 ? `评估完成！已评估 ${rp} 次（副本已存，均值±std 见对照表）` : "评估完成！序列对比与统计已生成并入库。");
         showEvalLog(true);
         // 刷新：序列数据 + 视频列表（tested 徽标）
         await loadGames();
@@ -829,6 +877,93 @@ const FT_STAGE_TEXT = {
 
 let FT_BACKEND_STATE = { mode: "local", remote_url: "", health: null };
 
+// ---------------- 顶部后端配置（评估/分析 + 微调共用） ----------------
+function updateBackendHeader() {
+  const dot = document.getElementById("backendDot");
+  const label = document.getElementById("backendLabel");
+  if (!dot || !label) return;
+  const b = FT_BACKEND_STATE || {};
+  if (b.mode === "remote") {
+    const ok = !!(b.health && b.health.available);
+    dot.className = "backend-dot " + (ok ? "online" : "offline");
+    label.textContent = ok ? "后端：远程 A100 ✓" : "后端：远程（未连接）";
+    label.title = b.remote_url || "";
+  } else {
+    dot.className = "backend-dot local";
+    label.textContent = "后端：本机";
+    label.title = "评估/分析与微调在本机 GPU 运行";
+  }
+}
+
+async function initBackendHeader() {
+  try {
+    FT_BACKEND_STATE = await api("/api/finetune/backend");
+  } catch (e) {
+    FT_BACKEND_STATE = { mode: "local", remote_url: "", health: null };
+  }
+  updateBackendHeader();
+}
+
+function openBackendModal() {
+  const b = FT_BACKEND_STATE || {};
+  const m = document.getElementById("bkMode");
+  if (m) m.value = b.mode || "local";
+  const rf = document.getElementById("bkRemoteFields");
+  if (rf) rf.style.display = b.mode === "remote" ? "block" : "none";
+  const u = document.getElementById("bkUrl"); if (u) u.value = b.remote_url || "";
+  const su = document.getElementById("bkSshUser"); if (su) su.value = (b.ssh && b.ssh.user) || "";
+  const sp = document.getElementById("bkSshPort"); if (sp) sp.value = (b.ssh && b.ssh.port) || "";
+  const spd = document.getElementById("bkSshPwd"); if (spd) spd.value = "";
+  const st = document.getElementById("bkStatus");
+  if (st) {
+    st.textContent = b.mode === "remote"
+      ? (b.health && b.health.available ? `远程 GPU 在线：${b.health.gpu}（${b.health.mem_gb} GB）` : "远程未连接")
+      : "评估与微调将在本机 GPU 运行";
+  }
+  const mod = document.getElementById("backendModal");
+  if (mod) mod.classList.remove("hidden");
+}
+
+function closeBackendModal() {
+  const mod = document.getElementById("backendModal");
+  if (mod) mod.classList.add("hidden");
+}
+
+async function saveBackendHeader() {
+  const mode = document.getElementById("bkMode").value;
+  const url = document.getElementById("bkUrl").value.trim();
+  const user = document.getElementById("bkSshUser").value.trim();
+  const port = document.getElementById("bkSshPort").value.trim();
+  const pwd = document.getElementById("bkSshPwd").value;
+  const params = [`mode=${encodeURIComponent(mode)}`];
+  if (mode === "remote") {
+    if (!url) { showError("请填写服务器地址"); return; }
+    params.push(`url=${encodeURIComponent(url)}`);
+    if (user) params.push(`ssh_user=${encodeURIComponent(user)}`);
+    if (port) params.push(`ssh_port=${encodeURIComponent(port)}`);
+    if (pwd) params.push(`ssh_password=${encodeURIComponent(pwd)}`);
+  }
+  try {
+    const r = await fetch(`/api/finetune/backend?${params.join("&")}`, { method: "POST" });
+    const j = await r.json();
+    if (!j.ok) { showError(j.error || "后端设置失败"); return; }
+    FT_BACKEND_STATE = j.data;
+    updateBackendHeader();
+    closeBackendModal();
+    // 同步微调面板（若已渲染）
+    const sel = document.getElementById("ftBackend");
+    if (sel) sel.value = j.data.mode;
+    const box = document.getElementById("ftRemoteBox");
+    if (box) box.style.display = j.data.mode === "remote" ? "inline" : "none";
+    const note = document.getElementById("ftBackendNote");
+    if (note) {
+      note.textContent = j.data.mode === "remote"
+        ? (j.data.health ? `${j.data.health.gpu} ✓在线` : "远程未连接")
+        : "本机 GPU";
+    }
+  } catch (e) { showError("后端设置失败: " + e.message); }
+}
+
 function renderFinetunePanel() {
   const el = document.getElementById("finetuneBody");
   if (!el) return;
@@ -849,7 +984,7 @@ function renderFinetunePanel() {
       </label>
       <span id="ftRemoteBox" style="display:none">
         <label for="ftRemoteUrl">远程地址：</label>
-        <input id="ftRemoteUrl" type="text" placeholder="http://10.14.3.52:56272" style="width:200px">
+        <input id="ftRemoteUrl" type="text" placeholder="http://服务器IP:端口" style="width:200px">
         <label for="ftSshPwd" style="margin-left:8px">SSH密码（缺数据自动上传用）：</label>
         <input id="ftSshPwd" type="password" placeholder="留空=不修改" style="width:110px">
         <button class="mini-btn" onclick="setBackend()">连接</button>
@@ -933,6 +1068,11 @@ function renderFinetunePanel() {
     if (tInp && prefs.test_size) tInp.value = prefs.test_size;
     if (fInp && prefs.filter_idle === "1") fInp.checked = true;
     if (rInp && prefs.eval_repeats) rInp.value = prefs.eval_repeats;
+    // 同步到指标条控件（刷新后仍保持上次勾选/次数）
+    const mfInp = document.getElementById("metricsFilterIdle");
+    const mrInp = document.getElementById("metricsRepeatsInput");
+    if (mfInp && prefs.filter_idle === "1") mfInp.checked = true;
+    if (mrInp && prefs.eval_repeats) mrInp.value = prefs.eval_repeats;
   }).catch(() => {});
 }
 
@@ -961,6 +1101,7 @@ async function setBackend(modeArg, urlArg) {
     const j = await r.json();
     if (!j.ok) { showError(j.error || "后端设置失败"); return; }
     FT_BACKEND_STATE = j.data;
+    updateBackendHeader();   // 同步顶部后端状态
     if (pwdInp) pwdInp.value = "";
     const note = document.getElementById("ftBackendNote");
     if (note) {

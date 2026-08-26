@@ -357,6 +357,11 @@ main { flex: 1; padding: 18px 24px; max-width: 1500px; width: 100%; margin: 0 au
 .metrics-resize input[type="number"]:focus {
   outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
 }
+.metrics-resize .metrics-check {
+  display: inline-flex; align-items: center; gap: 4px; cursor: pointer;
+  margin-left: 8px; color: var(--text);
+}
+.metrics-resize .metrics-check input { cursor: pointer; }
 .metrics-resize .primary-btn {
   background: var(--primary); color: #fff; border: none; border-radius: 6px;
   padding: 4px 10px; font-size: 12px; cursor: pointer;
@@ -592,6 +597,24 @@ main { flex: 1; padding: 18px 24px; max-width: 1500px; width: 100%; margin: 0 au
   margin: 0 auto 12px;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* 顶部后端配置块 */
+.backend-block {
+  display: flex; align-items: center; gap: 6px;
+  margin-left: 12px; padding: 6px 12px;
+  border: 1px solid var(--border); border-radius: 8px;
+  cursor: pointer; white-space: nowrap;
+  background: var(--bg-elev);
+  font-size: 13px;
+}
+.backend-block:hover { border-color: var(--accent); }
+.backend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.backend-dot.online { background: #4caf50; box-shadow: 0 0 6px #4caf50; }
+.backend-dot.offline { background: #f44336; }
+.backend-dot.local { background: #90a4ae; }
+
+.backend-form label { font-size: 13px; margin-right: 8px; }
+.backend-form input, .backend-form select { padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); }
 
 /* 响应式 */
 @media (max-width: 1100px) {
