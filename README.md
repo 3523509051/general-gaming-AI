@@ -1,34 +1,15 @@
-# 通用游戏智能体（课题七 · 腾讯 IEG 课题）
+# 通用游戏智能体：NitroGen 零样本评估与微调对照
 
-基于 NVIDIA **NitroGen** 开源视觉-动作基础模型（500M 参数 DiT，flow-matching 行为克隆，训练于 4 万小时 / 1000+ 游戏的手柄标注）的 zero-shot 推理、单游戏数据统计与定量评估实践。
+基于 NVIDIA **NitroGen** 开源视觉-动作基础模型（500M 参数 DiT，flow-matching 行为克隆，训练于 4 万小时 / 1000+ 游戏的手柄标注）的 zero-shot 推理、单游戏数据统计、定量评估与微调对照实践。
 
 - 论文：<https://arxiv.org/abs/2601.02427>
 - 官网：<https://nitrogen.minedojo.org/>
 - 官方代码：<https://github.com/MineDojo/NitroGen>
 - 模型权重（HF Hub）：<https://huggingface.co/nvidia/NitroGen>（含 `ng.pt` 预训练权重，CC BY-NC 4.0 非商业用途）
-- 数据集（HF Hub）：<https://huggingface.co/datasets/nvidia/NitroGen>（100 个分片，约 165 GB；本课题按需下载少量分片）
-- 本课题使用的切片：<https://huggingface.co/datasets/nvidia/NitroGen/blob/main/actions/SHARD_0034.tar.gz>（直接下载地址）
+- 数据集（HF Hub）：<https://huggingface.co/datasets/nvidia/NitroGen>（100 个分片，约 165 GB，按需下载少量分片）
+- 本仓库使用的切片：<https://huggingface.co/datasets/nvidia/NitroGen/blob/main/actions/SHARD_0034.tar.gz>（直接下载地址）
 
-> **⚠ 复现边界（先读）**
-> 本仓库**不含实验数据**（`data/` 整体在 `.gitignore`，含切片/视频/标注/结果库）。
-> **复现验证仅需证明代码可运行**，请按以下边界操作，**不要**擅自下载数据分片或视频：
-> - **必须做**：按「环境复现步骤」装依赖 → 下载 ng.pt → 跑通冒烟测试（第 6 节）→ 启动 Web 平台 → 确认页面/接口正常返回。
-> - **不必做**：下载 `SHARD_*.tar.gz` 切片、下载视频、提取标注、运行评估（这些是**可选项**，仅本课题作者按需执行，非复现验证的必要步骤）。
-> - 若需查看平台三 Tab 效果而本地无数据，请以"临时假实现/跳过"处理并在差距清单中注明，**不要**为补齐数据而下载约 3 GB 的分片与视频。
-> - 遇到 YouTube 下载需登录等外部依赖问题时，如实记录即可，不要绕路强行下载。
-
-## 课题范围（MVP 摘要）
-
-| # | 必做内容 | 状态 |
-| --- | --- | --- |
-| 1 | 跑通官方 ng.pt 推理，README 可复现 | ✅ 环境就绪，冒烟测试通过 |
-| 2 | 同一游戏标注 ≥ 500 帧：按键/摇杆分布统计 + ≥ 10 条序列可视化 | ✅ Hades（53.8 万帧）/ lies_of_p / star_fox_64 已提取并出图 |
-| 3 | 测试集（默认 200 帧，前端可调 10~5000）：按键一致率、摇杆 MSE / 相关系数 | ✅ hades / lies_of_p 已评估（B 口径，纯随机抽样，指标见指标条） |
-| 4 | zero-shot 基线对比 | ✅ 已对比（按键达标 ~0.5，摇杆相关 ~0 未达 0.4，分析见项目备忘）；并实现扩展 A 小样本微调对照（本机/远程双后端，见下文） |
-| 5 | 第 5 天演示：模型输出 vs 标注对比 | 🔶 前后端 Web 平台已完成，待演示走查 |
-| 6 | 归档代码与指标表，实验说明写入结课大报告 | 待做 |
-
-扩展方向：**可视化工具**——前后端 Web 平台，批量导出 ≥ 20 段动作曲线，标出差异最大的 5 帧（差异定义见项目备忘）。完整范围见 `立项书.md`（仅本地保留）。
+> **说明**：本仓库**不含实验数据**（`data/` 整体在 `.gitignore`，含切片/视频/标注/结果库）。安装依赖、下载权重、跑通冒烟测试后即可使用评估与微调对照功能；数据分片与视频为可选下载项。
 
 ## 目录结构
 
@@ -37,7 +18,7 @@ general-gaming-AI/
 ├── README.md             # 本文件（可复现说明 + 前后端工具用法）
 ├── 项目备忘.md            # 技术约定、实验结果、待决问题（仅本地保留，不入库）
 ├── 网页可视化平台实施文档.md # Web 平台设计（12 节，仅本地保留，不入库）
-├── scripts/              # 本课题自有脚本（数据流水线 + 平台后端）
+├── scripts/              # 本仓库脚本（数据流水线 + 平台后端）
 │   ├── app.py            # Flask 后端（Web 平台，10+ 接口）
 │   ├── scan_shard.py     # 一键识别切片：游戏/视频/链接清单（--merge 合并多切片）
 │   ├── extract_game.py   # 通用标注提取（--game/--video/--limit/--shard，自动发现全部切片）
@@ -172,7 +153,7 @@ SMOKE TEST PASSED
 课程约束：不得下载数据集全库（约 165 GB），按需下载**少量分片**即可。每个分片约 1~2 GB，含若干游戏的手柄标注：
 
 ```powershell
-# 例：下载 SHARD_0034（本课题已测的 hades / lies_of_p / star_fox_64 所在）
+# 例：下载 SHARD_0034（含 hades / lies_of_p / star_fox_64 等已测游戏）
 # 国内网络先设 HF 镜像：$env:HF_ENDPOINT = "https://hf-mirror.com"
 NitroGen\.venv\Scripts\python.exe -c "from huggingface_hub import hf_hub_download; hf_hub_download('nvidia/NitroGen','actions/SHARD_0034.tar.gz',repo_type='dataset')"
 # 下载会落在 HF 缓存，必须复制到 data/shards/（scan_shard/extract_game 只在该目录找切片）：
@@ -402,7 +383,7 @@ NitroGen\.venv\Scripts\python.exe scripts\evaluate.py --game <game> --video <vid
 
 ### Twitch 下载（长视频限流与规避）
 
-本课题切片中大量视频源为 **Twitch**（`source: twitch`），实测发现：
+本仓库切片中大量视频源为 **Twitch**（`source: twitch`），实测发现：
 
 **现象**：Twitch VOD 下载到**约 44%（≈50 分钟视频量 / ~800MB）后断流或极速限流**（从几 MB/s 降到几百 KB/s），yt-dlp 重试无效，退出码 1。位置固定（同一视频每次都卡在同一进度），已排除分片损坏（该处片段单独下载正常）。
 
