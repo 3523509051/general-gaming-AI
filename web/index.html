@@ -160,7 +160,10 @@
     <div class="recog-layout">
       <!-- 左：帧选择 + 画面 -->
       <div class="recog-left card">
-        <h3>帧选择</h3>
+        <h3>帧选择
+          <button class="ghost-btn" style="margin-left:8px;font-size:12px" onclick="triggerEvaluateFromMetrics()"
+                  title="对该游戏/视频运行零样本评估（无测试集时自动生成测试集；帧数/过滤IDLE/次数可用指标条或下方引导配置）">🧪 测试集评估</button>
+        </h3>
         <div class="frame-nav">
           <button class="ghost-btn" onclick="stepFrame(-1)">◀ 上一帧</button>
           <div class="frame-input-wrap">

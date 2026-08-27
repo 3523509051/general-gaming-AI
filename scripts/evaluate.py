@@ -161,6 +161,22 @@ def build_testset(game: str, video: str, video_file: Path, fps: int,
     else:
         # 纯随机均匀抽样（论文口径）：全视频可抽帧范围随机抽 test_size 帧
         total = sum(c["rows"] for c in chunks)
+        # 关键：标注帧数可能大于视频实际帧数（如标注 45600 帧但视频实际 30059 帧）。
+        # 超范围帧号 ffmpeg 抽不到会失败 → 用视频实际时长截断抽样范围。
+        # 用 `ffmpeg -i` 解析 stderr 的 Duration: hh:mm:ss.xx（ffmpeg 必有，不依赖 ffprobe）
+        try:
+            r = subprocess.run([ffmpeg, "-i", str(video_file)],
+                               capture_output=True, text=True, timeout=20)
+            import re as _re
+            m = _re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr or "")
+            if m:
+                dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                video_total = max(1, int(dur * fps))   # 视频实际帧数（时长×fps 估算）
+                if video_total < total:
+                    print(f"[build_testset] 标注帧数 {total} > 视频实际帧数 {video_total}，抽样范围截断到 {video_total}", flush=True)
+                    total = video_total
+        except Exception:  # noqa: BLE001
+            pass   # 探测失败则用标注帧数
         # 全局帧号 -> chunk 映射：off[i] 为 chunk i 的全局起始偏移
         off = [0]
         for c in chunks[:-1]:
@@ -191,7 +207,7 @@ def build_testset(game: str, video: str, video_file: Path, fps: int,
     }
 
     def _extract_frame(s, out_path: Path) -> bool:
-        """尝试抽帧：优先 -ss 前置（快 seek）；失败换 -ss 后置 + -noaccurate_seek（兼容性 seek）。"""
+        """单帧抽帧（回退用）：优先 -ss 前置（快 seek）；失败换 -ss 后置 + -noaccurate_seek（兼容 seek）。"""
         cmds = [
             [ffmpeg, "-y", "-ss", f"{s['second']:.3f}", "-i", str(video_file),
              "-frames:v", "1", str(out_path)],
@@ -208,13 +224,72 @@ def build_testset(game: str, video: str, video_file: Path, fps: int,
             out_path.unlink(missing_ok=True)
         return False
 
+    # ---- 连续抽帧（替代逐帧 -ss seek）----
+    # 对长视频（帧号几万级）逐帧随机 seek 极慢且易卡；改为按 chunk 分组，
+    # 每个 chunk 只用一次 ffmpeg（-ss 定位到 chunk 起点 + select 按帧号抽取），
+    # 输出帧数不符时回退该 chunk 的逐帧抽取。seek 次数从 N 次降到 chunk 数。
+    from collections import defaultdict
+    by_chunk = defaultdict(list)
+    for s in samples:
+        by_chunk[s["chunk"]].append(s)
+    extracted = {}   # absolute_frame -> bool
+    _done_cnt = 0    # 已成功抽出的帧数（用于进度打印）
+    _total_cnt = len(samples)
+
+    for c in chunks:
+        cs = by_chunk.get(c["chunk"])
+        if not cs:
+            continue
+        fids = sorted(x["frame_idx"] for x in cs)
+        start_sec = c["start_frame"] / fps
+        dur_sec = c["rows"] / fps
+        prefix = out_dir / f"{video}_batch{c['chunk']}"
+        select_expr = "+".join(f"eq(n,{fi})" for fi in fids)
+        cmd = [ffmpeg, "-y", "-ss", f"{start_sec:.3f}", "-i", str(video_file),
+               "-vf", f"select='{select_expr}'", "-vsync", "0", "-start_number", "0",
+               str(prefix) + "_%d.jpg"]
+        batch_ok = False
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=max(90, 15 * len(fids)))
+            batch_ok = r.returncode == 0
+        except Exception:  # noqa: BLE001
+            batch_ok = False
+        if batch_ok:
+            outs = sorted(prefix.parent.glob(prefix.name + "_*.jpg"),
+                          key=lambda p: int(p.stem.rsplit("_", 1)[1]))
+            if len(outs) == len(fids):
+                fid_map = {fids[k]: outs[k] for k in range(len(fids))}
+                for x in cs:
+                    src = fid_map.get(x["frame_idx"])
+                    if src and src.exists() and src.stat().st_size > 0:
+                        src.rename(out_dir / f"{video}_f{x['absolute_frame']:05d}.jpg")
+                        extracted[x["absolute_frame"]] = True
+                    else:
+                        extracted[x["absolute_frame"]] = False
+                _done_cnt = sum(1 for v in extracted.values() if v)
+                print(f"  抽帧进度 {_done_cnt}/{_total_cnt}", flush=True)
+                continue
+            # 输出帧数不符（seek 不精确）：清理临时帧，回退逐帧
+            for p in outs:
+                p.unlink(missing_ok=True)
+        for x in cs:
+            out_path = out_dir / f"{video}_f{x['absolute_frame']:05d}.jpg"
+            if not (out_path.exists() and out_path.stat().st_size > 0):
+                if not _extract_frame(x, out_path):
+                    print(f"WARN: 抽帧失败 frame={x['absolute_frame']}", flush=True)
+                    extracted[x["absolute_frame"]] = False
+                else:
+                    extracted[x["absolute_frame"]] = True
+            else:
+                extracted[x["absolute_frame"]] = True
+        _done_cnt = sum(1 for v in extracted.values() if v)
+        print(f"  抽帧进度 {_done_cnt}/{_total_cnt}", flush=True)
+
     rows = []
     for i, s in enumerate(samples):
+        if not extracted.get(s["absolute_frame"]):
+            continue
         out_path = out_dir / f"{s['video']}_f{s['absolute_frame']:05d}.jpg"
-        if not (out_path.exists() and out_path.stat().st_size > 0):
-            if not _extract_frame(s, out_path):
-                print(f"WARN: 抽帧失败 frame={s['absolute_frame']}", flush=True)
-                continue
         ann = ann_lookup.get((s["video"], s["chunk"], s["frame_idx"]), {})
         jl = ann.get("j_left", [0.0, 0.0])
         jr = ann.get("j_right", [0.0, 0.0])

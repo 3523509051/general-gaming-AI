@@ -22,6 +22,7 @@
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -111,6 +112,16 @@ def eval_base():
                 raise ValueError
         except ValueError:
             return jsonify({"ok": False, "error": "eval_repeats 应为 1~5 整数"}), 400
+    # 可选 fps：本地从 manifest 推导后传入；未传时 worker 从 manifest 推导，再默认 30
+    fps_raw = request.args.get("fps", "").strip()
+    fps = None
+    if fps_raw:
+        try:
+            fps = int(fps_raw)
+            if fps not in (24, 30, 50, 60):
+                raise ValueError
+        except ValueError:
+            return jsonify({"ok": False, "error": "fps 应为 24/30/50/60 整数"}), 400
     with _lock:
         if _task["running"]:
             return jsonify({"ok": False, "error": "已有任务运行中"}), 409
@@ -120,26 +131,46 @@ def eval_base():
                      log_tail="", error=None,
                      started_at=time.strftime("%H:%M:%S"), stage="baseline")
     threading.Thread(target=_run_eval_base,
-                     args=(game, video, test_size, eval_repeats), daemon=True).start()
+                     args=(game, video, test_size, eval_repeats, fps), daemon=True).start()
     return jsonify({"ok": True, "data": {"status": "started", "stage": "baseline"}}), 202
 
 
-def _run_eval_base(game: str, video: str, test_size: int | None, eval_repeats: int = 1):
+def _run_eval_base(game: str, video: str, test_size: int | None, eval_repeats: int = 1,
+                   fps: int | None = None):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     import shutil
     reps = max(1, eval_repeats)
     try:
+        # fps：本地传参 > 远程 manifest 推导 > 默认 30（避免 60fps 视频 seek 错位）
+        if fps is None:
+            try:
+                m = json.load(open(DATA / game / "manifest.json", encoding="utf-8"))
+                for c in m.get("chunks", []):
+                    if c.get("video") == video and c.get("rows"):
+                        cand = c["rows"] / 20.0
+                        for f2 in (24, 30, 50, 60):
+                            if abs(cand - f2) < 1.5:
+                                fps = f2
+                                break
+                        if fps is None:
+                            fps = round(cand)
+                        break
+            except Exception:  # noqa: BLE001
+                fps = 30
+        fps = fps or 30
         for i in range(reps):
             rtag = "ng" if reps == 1 else f"ng_s{i}"
             log_i = OUT_DIR / (f"base_{video}.eval.log" if reps == 1 else f"base_{video}.eval{i}.log")
             cmd = [str(BASE / ".venv" / "bin" / "python"), str(EVALUATE),
-                   "--game", game, "--video", video, "--fps", "30",
+                   "--game", game, "--video", video, "--fps", str(fps),
                    "--tag", rtag, "--no-plots", "--infer-seed", str(i)]
             if test_size:
                 cmd += ["--test-size", str(test_size)]
+            # PYTHONUNBUFFERED=1：强制子进程 stdout 无缓冲，进度日志实时写入文件（否则被块缓冲卡住，log_tail 一直为空）
+            env = {**os.environ, "PYTHONUNBUFFERED": "1"}
             proc = subprocess.Popen(cmd, cwd=str(BASE),
                                     stdout=open(log_i, "w", encoding="utf-8"),
-                                    stderr=subprocess.STDOUT)
+                                    stderr=subprocess.STDOUT, env=env)
             with _lock:
                 _task["proc"] = proc
             rc = proc.wait()
@@ -275,7 +306,10 @@ def status():
         t = {k: v for k, v in _task.items()}
     t.pop("proc", None)
     if t.get("out"):
+        # 兼容命名：微调日志 {out}.log；零样本评估日志 {out}.eval.log / {out}.eval{i}.log
         log = OUT_DIR / f"{t['out']}.log"
+        if not log.exists():
+            log = OUT_DIR / f"{t['out']}.eval.log"
         if log.exists():
             try:
                 lines = log.read_text(encoding="utf-8", errors="replace").splitlines()

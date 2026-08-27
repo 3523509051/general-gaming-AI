@@ -1367,6 +1367,8 @@ def _run_evaluate(game: str, video: str, fps: int, test_size: int | None = None,
 def _run_evaluate_remote(game: str, video: str, test_size: int | None, remote_url: str,
                          eval_repeats: int = 1):
     """远程评估：数据检查/自动上传 → worker /eval_base 评估 → 回传 ng CSV。"""
+    # 从 manifest 推导 fps 并传给 worker（worker 不再写死 30，避免 60fps 视频 seek 错位）
+    fps = _fps_from_manifest(game, video)
     log = DATA_ROOT / f"evaluate_{game}_{video}.log"
 
     def _log(msg: str):
@@ -1375,6 +1377,7 @@ def _run_evaluate_remote(game: str, video: str, test_size: int | None, remote_ur
 
     try:
         _log(f"=== 远程评估（A100 {remote_url}，test_size={test_size or 200}） ===")
+        _log(f"远程评估 fps={fps}（manifest 推导）")
         # 1) 远程数据齐备性：缺则自动上传（视频+manifest+annotations）
         with _eval_lock:
             _eval_task.update(stage="uploading")
@@ -1389,7 +1392,9 @@ def _run_evaluate_remote(game: str, video: str, test_size: int | None, remote_ur
         else:
             _log("远程数据齐备")
         # 2) 远程评估（零样本，tag=ng，与微调链基线同副本；eval_repeats>1 生成 _s{i} 副本）
-        code, resp = remote_eval_base(remote_url, game, video, test_size, eval_repeats=max(1, eval_repeats))
+        #    fps 从 manifest 推导传入，避免 worker 写死 30 导致 60fps 视频 seek 错位
+        code, resp = remote_eval_base(remote_url, game, video, test_size,
+                                      eval_repeats=max(1, eval_repeats), fps=fps)
         if code != 202:
             raise RuntimeError(f"远程评估启动失败（{code}）: {resp}")
         # 3) 轮询到完成（阶段同步到 _eval_task）
@@ -1586,6 +1591,7 @@ def _poll_remote_until_done(url: str, game: str, video: str, samples: int,
     task = _ft_task if task is None else task
     lock = _eval_lock if task is _eval_task else _ft_lock
     st = {}
+    _printed = set()   # 已打印过的日志行（避免重复）
     while True:
         try:
             with urllib.request.urlopen(url + "/status", timeout=10) as r:
@@ -1597,12 +1603,20 @@ def _poll_remote_until_done(url: str, game: str, video: str, samples: int,
                     task["stage"] = r_stage
             tail = st.get("log_tail") or ""
             if tail:
-                last = tail.splitlines()[-1]
-                if last and not last.startswith("["):
-                    log_fn(f"[remote] {last}")
+                for line in tail.splitlines():
+                    line = line.strip()
+                    if not line or line in _printed:
+                        continue
+                    _printed.add(line)
+                    # 进度行（抽帧/推理/WARN/测试集构建/完成）直接显示；其余简短显示
+                    if ("extracted" in line or "抽帧" in line or "WARN" in line
+                            or "inference" in line or "test set built" in line
+                            or "评估" in line or "done" in line.lower() or "抽样" in line):
+                        log_fn(f"[remote] {line}")
         except Exception as e:  # noqa: BLE001
             log_fn(f"[remote] status 轮询异常: {e}")
         if not st.get("running"):
+            log_fn("[remote] 评估完成 (done)")
             return st
         if st.get("stage") == "failed":
             raise RuntimeError(f"远程微调失败: {st.get('error')}")
@@ -1668,7 +1682,7 @@ def _csv_n_frames(path: Path) -> int | None:
 
 
 def remote_eval_base(url: str, game: str, video: str, test_size: int | None,
-                     eval_repeats: int = 1) -> tuple[int, dict | str]:
+                     eval_repeats: int = 1, fps: int | None = None) -> tuple[int, dict | str]:
     """调远程 worker /eval_base 跑零样本基线评估（A100），返回 (status_code, data或error)。"""
     import urllib.parse
     import urllib.request
@@ -1677,6 +1691,8 @@ def remote_eval_base(url: str, game: str, video: str, test_size: int | None,
         params["test_size"] = str(test_size)
     if eval_repeats and eval_repeats > 1:
         params["eval_repeats"] = str(eval_repeats)
+    if fps:
+        params["fps"] = str(fps)
     qs = urllib.parse.urlencode(params)
     try:
         req = urllib.request.Request(url + "/eval_base?" + qs, method="POST")
@@ -2337,8 +2353,26 @@ def api_finetune_compare():
     ft_rows = multi_rows(DATA_ROOT / game / "eval" / f"metrics_{video}_{tag}.csv")
     if not base_rows:
         return err(f"缺少零样本基线副本 metrics_{video}_ng.csv（先跑一次微调链或评估）", 404)
+    # 请求的 samples 无对应副本时，回退到该视频已有的任意微调副本（worker 上已有的直接用）
     if not ft_rows:
-        return err(f"缺少微调副本 metrics_{video}_{tag}.csv（samples={samples} 的微调尚未完成）", 404)
+        import re as _re
+        eval_dir = DATA_ROOT / game / "eval"
+        avail = []
+        for p in sorted(eval_dir.glob(f"metrics_{video}_ng_ft_*.csv")):
+            m = _re.match(rf"metrics_{video}_ng_ft_(\d+)(?:_s\d+)?\.csv", p.name)
+            if m and "s0" not in p.name:
+                cand = int(m.group(1))
+                if cand not in avail:
+                    avail.append(cand)
+        if avail:
+            samples = avail[0]
+            tag = f"ng_ft_{samples}"
+            ft_rows = multi_rows(eval_dir / f"metrics_{video}_{tag}.csv")
+            _used_fallback = f"请求 samples=21600 无副本，已改用已有微调副本 samples={samples}"
+        else:
+            return err(f"缺少微调副本 metrics_{video}_{tag}.csv（samples={samples} 的微调尚未完成）", 404)
+    else:
+        _used_fallback = None
     base = pack(base_rows)
     ft = pack(ft_rows)
 
@@ -2350,6 +2384,7 @@ def api_finetune_compare():
     n_repeat = max(len(base_rows), len(ft_rows))
     return ok({
         "game": game, "video": video, "samples": samples,
+        "used_fallback": _used_fallback,
         "baseline": base, "finetuned": ft,
         "delta": {
             "acc_17keys_all": delta("acc_17keys_all"),

@@ -228,8 +228,10 @@ async function onVideoChange(video) {
       setLineage(`${state.game} / ${video}（无测试集，请先运行评估）`, "warn");
     }
   } catch (e) {
-    setLineage(`${state.game} / ${video}（无测试集，请先运行评估脚本）`, "warn");
-    showError(e.message);
+    // 加载失败（如尚未读取本地分片）：Tab① 仍显示评估入口，并附错误提示
+    renderEvalGuideT1(String(e.message || ""));
+    setLineage(`${state.game} / ${video}（无测试集，请先运行评估）`, "warn");
+    if (e.message) showError(e.message);
   }
   // 核心指标对比条
   loadMetricsBanner();
@@ -736,11 +738,17 @@ async function loadSequences() {
 }
 
 // Tab① 未评估时的完整评估入口（帧数/过滤IDLE/评估次数/运行按钮）
-function renderEvalGuideT1() {
+// msg：可选，加载失败时的原因提示（如"尚未读取本地分片"）
+function renderEvalGuideT1(msg) {
   const box = document.getElementById("gamepad");
   if (!box) return;
+  // 防御：已渲染过手柄识别结果（gamepad 内已有按键/摇杆元素）时不覆盖，
+  // 避免评估完成后刷新竞态把"未评估引导"盖到手柄结果上
+  const hadResult = box.querySelector(".gp-btn") || box.querySelector(".gp-stick-dot");
+  if (hadResult) return;
   const cur = state.videos.find(v => v.video === state.video);
   const downloaded = cur && cur.status === "downloaded";
+  const errNote = msg ? `<p class="eval-guide-warn">⚠ ${msg.replace(/[<>&]/g, "")}</p>` : "";
   box.innerHTML = `
     <div class="eval-guide">
       <div class="eval-guide-icon">🧪</div>
@@ -748,6 +756,7 @@ function renderEvalGuideT1() {
         <h4>该视频尚未评估，单帧识别需要测试集帧列表（test_set CSV）</h4>
         <p>评估流程：抽测试集帧 → 加载 NitroGen 模型逐帧推理 → shift 扫描对齐 → 生成对比数据并入库。
            预计耗时 3~6 分钟（含模型加载），后台运行。</p>
+        ${errNote}
         <div class="eval-guide-form">
           <label for="testSizeInput">测试集帧数：</label>
           <input id="testSizeInput" type="number" min="10" max="5000" step="10" value="${localStorage.getItem('evalTestSize') || '200'}">
